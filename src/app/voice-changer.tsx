@@ -90,7 +90,7 @@ export default function VoiceChangerScreen() {
     ...systemVoices.slice(0, 20).map(voice => ({
       id: voice.voice_id,
       name: voice.name,
-      accent: voice.labels?.accent || voice.category || 'ElevenLabs',
+      accent: voice.labels?.accent || voice.category || 'System',
     })),
     ...clonedVoices.map(cv => ({
       id: cv.id,
@@ -287,7 +287,7 @@ export default function VoiceChangerScreen() {
         <View style={styles.introCard}>
           <Text style={styles.introTitle}>Speech-to-Speech conversion</Text>
           <Text style={styles.introText}>
-            Record a short voice clip, select a target voice below, and ElevenLabs will re-synthesize your words retaining your pacing and tone, but utilizing the selected voice's physical vocal print.
+            Record a short voice clip, select a target voice below, and our AI models will re-synthesize your words retaining your pacing and tone, but utilizing the selected voice's physical vocal print.
           </Text>
         </View>
 
@@ -379,7 +379,7 @@ export default function VoiceChangerScreen() {
           <View style={styles.processingCard}>
             <ActivityIndicator size="large" color={colors.primary} style={{ marginBottom: 16 }} />
             <Text style={styles.processingTitle}>Re-synthesizing vocal prints...</Text>
-            <Text style={styles.processingSub}>Passing source acoustics through ElevenLabs neural converter to output voice model '{selectedVoiceName}'.</Text>
+            <Text style={styles.processingSub}>Passing source acoustics through our neural converter to output voice model '{selectedVoiceName}'.</Text>
           </View>
         )}
 

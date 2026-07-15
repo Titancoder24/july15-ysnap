@@ -257,7 +257,7 @@ export default function VoiceLibraryScreen() {
 
         {/* System Voices Listing */}
         <View style={styles.section}>
-          <Text style={styles.sectionTitle}>ELEVENLABS SYSTEM VOICES ({filteredVoices.length})</Text>
+          <Text style={styles.sectionTitle}>SYSTEM VOICES ({filteredVoices.length})</Text>
           {isLoadingEleven ? (
             <ActivityIndicator size="small" color={colors.primary} style={{ marginVertical: 20 }} />
           ) : (

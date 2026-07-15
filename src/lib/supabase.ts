@@ -102,7 +102,7 @@ async function readFunctionError(error: unknown): Promise<Error> {
     const providerMessage = payload.error || payload.message;
     if (providerMessage) {
       if (providerMessage.includes('ELEVENLABS_API_KEY is not configured')) {
-        return new Error('Voice services are not configured in Supabase yet. Add the ElevenLabs secret and try again.');
+        return new Error('Voice services are not configured in Supabase yet. Add the voice service secret key and try again.');
       }
       if (providerMessage.includes('GEMINI_API_KEY is not configured')) {
         return new Error('Translation services are not configured in Supabase yet. Add the Gemini secret and try again.');

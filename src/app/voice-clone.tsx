@@ -256,7 +256,7 @@ export default function VoiceCloneScreen() {
             <View style={styles.termsBox}>
               <ScrollView nestedScrollEnabled={false} style={{ maxHeight: 200 }}>
                 <Text style={styles.termsText}>
-                  By consenting below, you grant YSnap permission to process a digital audio recording of your voice. This biometric data is parsed solely by ElevenLabs API protocols to create a synthetic voice replication. YSnap does not rent, sell, or monetize voice prints. The voice model remains associated exclusively with your secure account.
+                  By consenting below, you grant YSnap permission to process a digital audio recording of your voice. This biometric data is parsed solely by our secure API protocols to create a synthetic voice replication. YSnap does not rent, sell, or monetize voice prints. The voice model remains associated exclusively with your secure account.
                 </Text>
               </ScrollView>
             </View>
@@ -314,7 +314,7 @@ export default function VoiceCloneScreen() {
               <Text style={styles.stepTitle}>Record Speech Sample</Text>
             </View>
             <Text style={styles.stepSubtitle}>
-              Record 10–30 seconds in a quiet room. Thirty seconds is better for a quick clone; ElevenLabs recommends 1–2 minutes for highest reliability.
+              Record 10–30 seconds in a quiet room. Thirty seconds is better for a quick clone; we recommend 1–2 minutes for highest reliability.
             </Text>
 
             {/* Custom Voice Name Input */}
