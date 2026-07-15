@@ -12,6 +12,7 @@ import {
   ScrollView,
   Linking,
   Platform,
+  Animated,
 } from 'react-native';
 import { CameraView, useCameraPermissions, FlashMode } from 'expo-camera';
 import * as ImagePicker from 'expo-image-picker';
@@ -49,10 +50,12 @@ async function callGeminiLiveAR(base64Image: string, targetLang: string, tappedC
     Provide:
     1. "name": The English name of the object.
     2. "translatedName": The name of the object translated to the target language code "${targetLang}".
-    3. "description": A short, engaging, agentic 2-sentence description of the object and how a user might interact with it, written in the target language.
+    3. "description": A short, engaging, agentic 2-sentence description of the object. If it is a food/beverage, explain its background and include its approximate calories/macros.
     4. "boundingBox": A JSON object with coordinates { x: number, y: number, w: number, h: number } where the values are relative percentages (0 to 100) indicating where the object is located in the image frame.
+    5. "isFood": A boolean indicating if this is an edible food or drink.
+    6. "foodDetails": If isFood is true, include: { "calories": number, "protein": "Xg", "carbs": "Xg", "fat": "Xg", "allergens": ["allergen1", "allergen2"] }. Otherwise leave null.
 
-    Format your response as a strict JSON object with these keys: "name", "translatedName", "description", "boundingBox". Do not add markdown backticks or any other text.
+    Format your response as a strict JSON object with these keys: "name", "translatedName", "description", "boundingBox", "isFood", "foodDetails". Do not add markdown backticks or any other text.
   `;
 
   const body = {
@@ -109,6 +112,60 @@ export default function CameraScreen() {
   const [capturedImage, setCapturedImage] = useState<string | null>(null);
   const [tappedLocation, setTappedLocation] = useState<{ x: number, y: number } | null>(null);
   const player = useAudioPlayer('');
+
+  // Animated values
+  const pulseAnim = useRef(new Animated.Value(1)).current;
+  const scanLineAnim = useRef(new Animated.Value(0)).current;
+  const breathingAnim = useRef(new Animated.Value(0.4)).current;
+  const scanLoopRef = useRef<Animated.CompositeAnimation | null>(null);
+
+  // Breathing loop for bounding box
+  useEffect(() => {
+    const breathing = Animated.loop(
+      Animated.sequence([
+        Animated.timing(breathingAnim, {
+          toValue: 0.95,
+          duration: 1200,
+          useNativeDriver: Platform.OS !== 'web',
+        }),
+        Animated.timing(breathingAnim, {
+          toValue: 0.4,
+          duration: 1200,
+          useNativeDriver: Platform.OS !== 'web',
+        })
+      ])
+    );
+    breathing.start();
+    return () => breathing.stop();
+  }, []);
+
+  // Monitor isProcessing state to start/stop the laser scan animation
+  useEffect(() => {
+    if (isProcessing) {
+      scanLineAnim.setValue(0);
+      scanLoopRef.current = Animated.loop(
+        Animated.sequence([
+          Animated.timing(scanLineAnim, {
+            toValue: 100,
+            duration: 1500,
+            useNativeDriver: false, // percentage position requires false
+          }),
+          Animated.timing(scanLineAnim, {
+            toValue: 0,
+            duration: 1500,
+            useNativeDriver: false,
+          })
+        ])
+      );
+      scanLoopRef.current.start();
+    } else {
+      if (scanLoopRef.current) {
+        scanLoopRef.current.stop();
+        scanLoopRef.current = null;
+      }
+      scanLineAnim.setValue(0);
+    }
+  }, [isProcessing]);
 
   // Gemini vision analysis returned by the authenticated Edge Function or Gemini API.
   const [analysisResult, setAnalysisResult] = useState<{
@@ -247,6 +304,14 @@ export default function CameraScreen() {
     
     setTappedLocation({ x: locationX, y: locationY });
     Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
+
+    pulseAnim.setValue(0.5);
+    Animated.spring(pulseAnim, {
+      toValue: 1.25,
+      friction: 4,
+      tension: 40,
+      useNativeDriver: Platform.OS !== 'web',
+    }).start();
     
     handleCapture({ x: relX, y: relY });
   };
@@ -324,7 +389,16 @@ export default function CameraScreen() {
         setAnalysisResult({
           originalText: geminiResult.name || 'Object',
           translatedText: geminiResult.translatedName || 'Objeto',
-          foodInfo: undefined,
+          foodInfo: geminiResult.isFood ? {
+            name: geminiResult.name || 'Food',
+            translatedName: geminiResult.translatedName || 'Alimento',
+            calories: Number(geminiResult.foodDetails?.calories || 0),
+            protein: geminiResult.foodDetails?.protein || '0g',
+            carbs: geminiResult.foodDetails?.carbs || '0g',
+            fat: geminiResult.foodDetails?.fat || '0g',
+            allergens: Array.isArray(geminiResult.foodDetails?.allergens) ? geminiResult.foodDetails.allergens : [],
+            confidence: 95,
+          } : undefined,
           ocrBoxes: [],
           arData: {
             boundingBox: geminiResult.boundingBox || { x: 30, y: 35, w: 40, h: 30 },
@@ -503,7 +577,7 @@ export default function CameraScreen() {
             {/* AR Bounding Box & Target Highlight overlay */}
             {analysisResult && mode === 'ar' && analysisResult.arData && (
               <View style={styles.ocrOverlay}>
-                <View
+                <Animated.View
                   style={[
                     styles.arBoundingBox,
                     {
@@ -511,6 +585,7 @@ export default function CameraScreen() {
                       top: `${analysisResult.arData.boundingBox.y}%`,
                       width: `${analysisResult.arData.boundingBox.w}%`,
                       height: `${analysisResult.arData.boundingBox.h}%`,
+                      opacity: breathingAnim,
                     },
                   ]}
                 >
@@ -523,12 +598,23 @@ export default function CameraScreen() {
                     <Ionicons name="sparkles" size={10} color={colors.textInverse} style={{ marginRight: 4 }} />
                     <Text style={styles.arFloatingBadgeText}>{analysisResult.translatedText}</Text>
                   </View>
-                </View>
+                </Animated.View>
               </View>
             )}
 
             {isProcessing && (
               <View style={styles.processingMask}>
+                <Animated.View 
+                  style={[
+                    styles.scanningLaserLine,
+                    {
+                      top: scanLineAnim.interpolate({
+                        inputRange: [0, 100],
+                        outputRange: ['0%', '100%'],
+                      }),
+                    },
+                  ]} 
+                />
                 <ActivityIndicator size="large" color={colors.background} />
                 <Text style={styles.processingText}>AI Scanning image...</Text>
               </View>
@@ -545,17 +631,19 @@ export default function CameraScreen() {
               <CameraView style={styles.cameraView} flash={flash} ref={cameraRef} facing="back">
                 {/* Render tapped target cursor */}
                 {tappedLocation && (
-                  <View 
+                  <Animated.View 
                     style={[
                       styles.tappedTargetRing,
                       {
                         left: tappedLocation.x - 24,
                         top: tappedLocation.y - 24,
+                        transform: [{ scale: pulseAnim }],
                       }
                     ]}
                   >
                     <View style={styles.tappedTargetDot} />
-                  </View>
+                    <View style={styles.tappedTargetOuterRing} />
+                  </Animated.View>
                 )}
 
                 <View style={styles.overlayFrameContainer}>
@@ -666,6 +754,41 @@ export default function CameraScreen() {
                   <Text style={styles.agentText}>{analysisResult.arData.description}</Text>
                 </View>
               </View>
+
+              {/* Optional integrated nutrition facts if the tracked object is food */}
+              {analysisResult.foodInfo && (
+                <View style={{ marginTop: 16, borderTopWidth: 1, borderTopColor: colors.border, paddingTop: 16 }}>
+                  <Text style={[styles.sectionLabel, { marginBottom: 8, color: colors.accentPurple }]}>NUTRITION ESTIMATION</Text>
+                  
+                  <View style={styles.macroRow}>
+                    <View style={styles.macroItem}>
+                      <Text style={styles.macroValue}>{analysisResult.foodInfo.calories}</Text>
+                      <Text style={styles.macroLabel}>CALORIES</Text>
+                    </View>
+                    <View style={styles.macroItem}>
+                      <Text style={[styles.macroValue, { color: colors.accentBlue }]}>{analysisResult.foodInfo.protein}</Text>
+                      <Text style={styles.macroLabel}>PROTEIN</Text>
+                    </View>
+                    <View style={styles.macroItem}>
+                      <Text style={[styles.macroValue, { color: colors.accentOrange }]}>{analysisResult.foodInfo.carbs}</Text>
+                      <Text style={styles.macroLabel}>CARBS</Text>
+                    </View>
+                    <View style={styles.macroItem}>
+                      <Text style={[styles.macroValue, { color: colors.accentCoral }]}>{analysisResult.foodInfo.fat}</Text>
+                      <Text style={styles.macroLabel}>FAT</Text>
+                    </View>
+                  </View>
+
+                  {analysisResult.foodInfo.allergens && analysisResult.foodInfo.allergens.length > 0 && (
+                    <View style={styles.allergenAlertCard}>
+                      <Ionicons name="warning-outline" size={16} color={colors.warning} />
+                      <Text style={styles.allergenAlertText}>
+                        Allergen Warnings: {analysisResult.foodInfo.allergens.join(', ')}
+                      </Text>
+                    </View>
+                  )}
+                </View>
+              )}
             </View>
           ) : (
             /* OCR TEXT RESULTS SCREEN DISPLAY */
@@ -1307,5 +1430,27 @@ const styles = StyleSheet.create({
     ...typography.bodySmall,
     color: colors.textSecondary,
     lineHeight: 18,
+  },
+  scanningLaserLine: {
+    position: 'absolute',
+    left: 0,
+    right: 0,
+    height: 4,
+    backgroundColor: colors.accentPurple,
+    shadowColor: colors.accentPurple,
+    shadowOffset: { width: 0, height: 0 },
+    shadowOpacity: 0.9,
+    shadowRadius: 8,
+    elevation: 5,
+    zIndex: 2,
+  },
+  tappedTargetOuterRing: {
+    position: 'absolute',
+    width: 64,
+    height: 64,
+    borderRadius: 32,
+    borderWidth: 1.5,
+    borderColor: 'rgba(124, 108, 208, 0.4)',
+    borderStyle: 'dashed',
   },
 });
