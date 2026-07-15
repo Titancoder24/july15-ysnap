@@ -20,7 +20,6 @@ const ACTIONS = [
   { title: 'Type', caption: 'Translate text', iconName: 'type' as const, route: '/text-translation' },
   { title: 'Voice', caption: 'Speak naturally', iconName: 'voice' as const, route: '/voice-translation' },
   { title: 'Camera', caption: 'Scan what you see', iconName: 'camera' as const, route: '/(tabs)/camera' },
-  { title: 'Conversation', caption: 'Talk face to face', iconName: 'converse' as const, route: '/(tabs)/converse' },
   { title: 'Accent Changer', caption: 'Change your accent', iconName: 'speaker' as const, route: '/voice-changer' },
   { title: 'Voice Clone', caption: 'Clone your voice', iconName: 'voice' as const, route: '/voice-clone' },
 ] as const;
@@ -177,7 +176,7 @@ export default function HomeScreen() {
               <ArrowRight size={17} color={colors.textSubtle} style={styles.actionArrow} />
             </Pressable>
             
-            {/* Card 4: Conversation */}
+            {/* Card 4: Accent Changer */}
             <Pressable 
               style={({ pressed }) => [styles.actionCard, pressed && styles.cardPressed]} 
               onPress={() => open(ACTIONS[3].route)}
@@ -194,7 +193,7 @@ export default function HomeScreen() {
           </View>
 
           <View style={styles.actionRow}>
-            {/* Card 5: Accent Changer */}
+            {/* Card 5: Voice Clone */}
             <Pressable 
               style={({ pressed }) => [styles.actionCard, pressed && styles.cardPressed]} 
               onPress={() => open(ACTIONS[4].route)}
@@ -206,21 +205,6 @@ export default function HomeScreen() {
               />
               <Text style={styles.actionTitle}>{ACTIONS[4].title}</Text>
               <Text style={styles.actionCaption}>{ACTIONS[4].caption}</Text>
-              <ArrowRight size={17} color={colors.textSubtle} style={styles.actionArrow} />
-            </Pressable>
-            
-            {/* Card 6: Voice Clone */}
-            <Pressable 
-              style={({ pressed }) => [styles.actionCard, pressed && styles.cardPressed]} 
-              onPress={() => open(ACTIONS[5].route)}
-            >
-              <DimensionalIcon
-                icon={<AppIcon name={ACTIONS[5].iconName} size={20} />}
-                containerSize={42}
-                style={{ marginBottom: spacing.sm }}
-              />
-              <Text style={styles.actionTitle}>{ACTIONS[5].title}</Text>
-              <Text style={styles.actionCaption}>{ACTIONS[5].caption}</Text>
               <ArrowRight size={17} color={colors.textSubtle} style={styles.actionArrow} />
             </Pressable>
           </View>

@@ -28,7 +28,7 @@ export default function TabsLayout() {
         <Tabs.Screen
           name="converse"
           options={{
-            title: 'Converse',
+            href: null,
           }}
         />
         <Tabs.Screen
