@@ -253,8 +253,8 @@ export default function ConverseTab() {
           sequence_number: turns.length + 1,
           source_text: turn.originalText,
           translated_text: turn.translatedText || null,
-          detected_language: turn.detectedLanguage || null,
-          detected_language_name: turn.detectedLanguageName || null,
+          detected_language: turn.detected_language || null,
+          detected_language_name: turn.detected_language_name || null,
           source_language: turn.sourceLanguage,
           target_language: turn.targetLanguage,
           source_panel: turn.sourcePanel,
@@ -277,12 +277,12 @@ export default function ConverseTab() {
   };
 
   const handleToggleRecording = async () => {
-    if (processingState !== 'idle' && processingState !== 'ready' && processingState !== 'error') {
+    if (isRecording) {
+      await handleStopRecording();
       return;
     }
 
-    if (isRecording) {
-      await handleStopRecording();
+    if (processingState !== 'idle' && processingState !== 'ready' && processingState !== 'error') {
       return;
     }
 
@@ -800,60 +800,58 @@ export default function ConverseTab() {
 
     const isSource = lastCompletedTurn.sourcePanel === 'first';
     
-    if (isSource) {
-      return (
-        <View style={styles.panelCard}>
-          <View style={styles.panelCardHeader}>
-            <Text style={styles.panelCardLangDark}>{getLanguageName(topLanguage).toUpperCase()}</Text>
-            {lastCompletedTurn.detectedLanguageName && (
-              <Text style={styles.panelCardDetectedDark}>({lastCompletedTurn.detectedLanguageName})</Text>
-            )}
+    return (
+      <ScrollView contentContainerStyle={styles.panelScrollContent} showsVerticalScrollIndicator={false}>
+        {isSource ? (
+          <View style={styles.panelCard}>
+            <View style={styles.panelCardHeader}>
+              <Text style={styles.panelCardLangDark}>{getLanguageName(topLanguage).toUpperCase()}</Text>
+              {lastCompletedTurn.detectedLanguageName && (
+                <Text style={styles.panelCardDetectedDark}>({lastCompletedTurn.detectedLanguageName})</Text>
+              )}
+            </View>
+            <Text style={styles.panelCardTextDark}>{lastCompletedTurn.originalText}</Text>
           </View>
-          <Text style={styles.panelCardTextDark}>{lastCompletedTurn.originalText}</Text>
-        </View>
-      );
-    } else {
-      if (lastCompletedTurn.translationError) {
-        return (
-          <View style={styles.errorCard}>
-            <Ionicons name="warning" size={24} color={colors.error} style={{ marginBottom: 8 }} />
-            <Text style={styles.errorCardTextDark}>Translation failed</Text>
-            <Pressable style={styles.retryBtnDark} onPress={() => handleRetryTranslation(lastCompletedTurn.id)}>
-              <Ionicons name="refresh" size={14} color="#FFFFFF" style={{ marginRight: 4 }} />
-              <Text style={styles.retryBtnTextDark}>Retry translation</Text>
-            </Pressable>
-          </View>
-        );
-      }
-
-      return (
-        <View style={styles.panelCard}>
-          <View style={styles.panelCardHeader}>
-            <Text style={styles.panelCardLangDark}>{getLanguageName(topLanguage).toUpperCase()}</Text>
-            {lastCompletedTurn.translatedAudioUrl && (
-              <Pressable 
-                style={styles.speakerIconDark} 
-                onPress={() => {
-                  player.replace({ uri: lastCompletedTurn.translatedAudioUrl });
-                  player.play();
-                }}
-              >
-                <Ionicons name="volume-medium" size={22} color="#FFFFFF" />
-              </Pressable>
-            )}
-          </View>
-          <Text style={styles.panelCardTextDarkTranslated}>{lastCompletedTurn.translatedText}</Text>
-          {lastCompletedTurn.speechError && (
-            <View style={styles.errorRow}>
-              <Text style={styles.errorSubTextDark}>Voice generation failed</Text>
-              <Pressable style={styles.retryTextBtn} onPress={() => handleRetrySpeech(lastCompletedTurn.id)}>
-                <Text style={styles.retryTextBtnTxt}>Retry voice</Text>
+        ) : (
+          lastCompletedTurn.translationError ? (
+            <View style={styles.errorCard}>
+              <Ionicons name="warning" size={24} color={colors.error} style={{ marginBottom: 8 }} />
+              <Text style={styles.errorCardTextDark}>Translation failed</Text>
+              <Pressable style={styles.retryBtnDark} onPress={() => handleRetryTranslation(lastCompletedTurn.id)}>
+                <Ionicons name="refresh" size={14} color="#FFFFFF" style={{ marginRight: 4 }} />
+                <Text style={styles.retryBtnTextDark}>Retry translation</Text>
               </Pressable>
             </View>
-          )}
-        </View>
-      );
-    }
+          ) : (
+            <View style={styles.panelCard}>
+              <View style={styles.panelCardHeader}>
+                <Text style={styles.panelCardLangDark}>{getLanguageName(topLanguage).toUpperCase()}</Text>
+                {lastCompletedTurn.translatedAudioUrl && (
+                  <Pressable 
+                    style={styles.speakerIconDark} 
+                    onPress={() => {
+                      player.replace({ uri: lastCompletedTurn.translatedAudioUrl });
+                      player.play();
+                    }}
+                  >
+                    <Ionicons name="volume-medium" size={22} color="#FFFFFF" />
+                  </Pressable>
+                )}
+              </View>
+              <Text style={styles.panelCardTextDarkTranslated}>{lastCompletedTurn.translatedText}</Text>
+              {lastCompletedTurn.speechError && (
+                <View style={styles.errorRow}>
+                  <Text style={styles.errorSubTextDark}>Voice generation failed</Text>
+                  <Pressable style={styles.retryTextBtn} onPress={() => handleRetrySpeech(lastCompletedTurn.id)}>
+                    <Text style={styles.retryTextBtnTxt}>Retry voice</Text>
+                  </Pressable>
+                </View>
+              )}
+            </View>
+          )
+        )}
+      </ScrollView>
+    );
   };
 
   const renderSecondPanel = () => {
@@ -877,60 +875,58 @@ export default function ConverseTab() {
 
     const isSource = lastCompletedTurn.sourcePanel === 'second';
 
-    if (isSource) {
-      return (
-        <View style={styles.panelCard}>
-          <View style={styles.panelCardHeader}>
-            <Text style={styles.panelCardLangLight}>{getLanguageName(bottomLanguage).toUpperCase()}</Text>
-            {lastCompletedTurn.detectedLanguageName && (
-              <Text style={styles.panelCardDetectedLight}>({lastCompletedTurn.detectedLanguageName})</Text>
-            )}
+    return (
+      <ScrollView contentContainerStyle={styles.panelScrollContent} showsVerticalScrollIndicator={false}>
+        {isSource ? (
+          <View style={styles.panelCard}>
+            <View style={styles.panelCardHeader}>
+              <Text style={styles.panelCardLangLight}>{getLanguageName(bottomLanguage).toUpperCase()}</Text>
+              {lastCompletedTurn.detectedLanguageName && (
+                <Text style={styles.panelCardDetectedLight}>({lastCompletedTurn.detectedLanguageName})</Text>
+              )}
+            </View>
+            <Text style={styles.panelCardTextLight}>{lastCompletedTurn.originalText}</Text>
           </View>
-          <Text style={styles.panelCardTextLight}>{lastCompletedTurn.originalText}</Text>
-        </View>
-      );
-    } else {
-      if (lastCompletedTurn.translationError) {
-        return (
-          <View style={styles.errorCard}>
-            <Ionicons name="warning" size={24} color={colors.error} style={{ marginBottom: 8 }} />
-            <Text style={styles.errorCardTextLight}>Translation failed</Text>
-            <Pressable style={styles.retryBtnLight} onPress={() => handleRetryTranslation(lastCompletedTurn.id)}>
-              <Ionicons name="refresh" size={14} color={colors.textPrimary} style={{ marginRight: 4 }} />
-              <Text style={styles.retryBtnTextLight}>Retry translation</Text>
-            </Pressable>
-          </View>
-        );
-      }
-
-      return (
-        <View style={styles.panelCard}>
-          <View style={styles.panelCardHeader}>
-            <Text style={styles.panelCardLangLight}>{getLanguageName(bottomLanguage).toUpperCase()}</Text>
-            {lastCompletedTurn.translatedAudioUrl && (
-              <Pressable 
-                style={styles.speakerIconLight} 
-                onPress={() => {
-                  player.replace({ uri: lastCompletedTurn.translatedAudioUrl });
-                  player.play();
-                }}
-              >
-                <Ionicons name="volume-medium" size={22} color={colors.textPrimary} />
-              </Pressable>
-            )}
-          </View>
-          <Text style={styles.panelCardTextLightTranslated}>{lastCompletedTurn.translatedText}</Text>
-          {lastCompletedTurn.speechError && (
-            <View style={styles.errorRow}>
-              <Text style={styles.errorSubTextLight}>Voice generation failed</Text>
-              <Pressable style={styles.retryTextBtn} onPress={() => handleRetrySpeech(lastCompletedTurn.id)}>
-                <Text style={styles.retryTextBtnTxt}>Retry voice</Text>
+        ) : (
+          lastCompletedTurn.translationError ? (
+            <View style={styles.errorCard}>
+              <Ionicons name="warning" size={24} color={colors.error} style={{ marginBottom: 8 }} />
+              <Text style={styles.errorCardTextLight}>Translation failed</Text>
+              <Pressable style={styles.retryBtnLight} onPress={() => handleRetryTranslation(lastCompletedTurn.id)}>
+                <Ionicons name="refresh" size={14} color={colors.textPrimary} style={{ marginRight: 4 }} />
+                <Text style={styles.retryBtnTextLight}>Retry translation</Text>
               </Pressable>
             </View>
-          )}
-        </View>
-      );
-    }
+          ) : (
+            <View style={styles.panelCard}>
+              <View style={styles.panelCardHeader}>
+                <Text style={styles.panelCardLangLight}>{getLanguageName(bottomLanguage).toUpperCase()}</Text>
+                {lastCompletedTurn.translatedAudioUrl && (
+                  <Pressable 
+                    style={styles.speakerIconLight} 
+                    onPress={() => {
+                      player.replace({ uri: lastCompletedTurn.translatedAudioUrl });
+                      player.play();
+                    }}
+                  >
+                    <Ionicons name="volume-medium" size={22} color={colors.textPrimary} />
+                  </Pressable>
+                )}
+              </View>
+              <Text style={styles.panelCardTextLightTranslated}>{lastCompletedTurn.translatedText}</Text>
+              {lastCompletedTurn.speechError && (
+                <View style={styles.errorRow}>
+                  <Text style={styles.errorSubTextLight}>Voice generation failed</Text>
+                  <Pressable style={styles.retryTextBtn} onPress={() => handleRetrySpeech(lastCompletedTurn.id)}>
+                    <Text style={styles.retryTextBtnTxt}>Retry voice</Text>
+                  </Pressable>
+                </View>
+              )}
+            </View>
+          )
+        )}
+      </ScrollView>
+    );
   };
 
   return (
@@ -988,37 +984,67 @@ export default function ConverseTab() {
           {renderFirstPanel()}
         </View>
 
-        {/* Bottom Light Panel */}
-        <View style={[
-          styles.bottomPanel,
-          lastCompletedTurn && lastCompletedTurn.sourcePanel === 'second' && styles.activePanelGlowLight
-        ]}>
-          {renderSecondPanel()}
-
-          {/* Badges/Settings Row at the bottom */}
-          <View style={styles.bottomSettingsRow}>
+        {/* Center Control Strip (Inline, Non-overlapped) */}
+        <View style={styles.centerControlBar}>
+          {/* Left Column: settings toggles */}
+          <View style={styles.leftControlCol}>
             <View style={styles.settingToggle}>
-              <Text style={styles.settingText}>Auto-VAD</Text>
+              <Text style={styles.settingText}>VAD</Text>
               <Switch
                 value={vadEnabled}
                 onValueChange={setVadEnabled}
                 thumbColor={colors.primary}
                 trackColor={{ true: colors.primary, false: colors.borderStrong }}
+                style={{ transform: [{ scaleX: 0.75 }, { scaleY: 0.75 }] }}
               />
             </View>
 
             <View style={styles.settingToggle}>
-              <Text style={styles.settingText}>Auto-Play</Text>
+              <Text style={styles.settingText}>Play</Text>
               <Switch
                 value={autoPlay}
                 onValueChange={setAutoPlay}
                 thumbColor={colors.primary}
                 trackColor={{ true: colors.primary, false: colors.borderStrong }}
+                style={{ transform: [{ scaleX: 0.75 }, { scaleY: 0.75 }] }}
               />
             </View>
+          </View>
 
+          {/* Center Column: The circular mic button with elapsed time */}
+          <View style={styles.centerMicCol}>
+            {isRecording ? (
+              <View style={styles.timerTextContainer}>
+                <Text style={styles.timerText}>
+                  00:{elapsedSeconds < 10 ? `0${elapsedSeconds}` : elapsedSeconds}
+                </Text>
+              </View>
+            ) : null}
+
+            <Pressable
+              style={[
+                styles.centerMicButton,
+                isRecording && styles.centerMicButtonRecording
+              ]}
+              onPress={handleToggleRecording}
+              disabled={processingState !== 'idle' && processingState !== 'recording' && processingState !== 'ready' && processingState !== 'error'}
+            >
+              {processingState === 'transcribing' || processingState === 'translating' || processingState === 'generating-speech' ? (
+                <ActivityIndicator size="small" color="#FFFFFF" />
+              ) : (
+                <Ionicons 
+                  name={isRecording ? "stop" : "mic"} 
+                  size={28} 
+                  color="#FFFFFF" 
+                />
+              )}
+            </Pressable>
+          </View>
+
+          {/* Right Column: session utilities (Clear & Finish) */}
+          <View style={styles.rightControlCol}>
             <Pressable style={styles.actionBtnIcon} onPress={handleResetSession}>
-              <Ionicons name="trash" size={18} color={colors.error} />
+              <Ionicons name="trash-outline" size={18} color={colors.error} />
             </Pressable>
 
             <Pressable style={styles.actionBtnText} onPress={handleFinishSession}>
@@ -1027,50 +1053,12 @@ export default function ConverseTab() {
           </View>
         </View>
 
-        {/* Central Overlay Mic Button */}
-        <View style={styles.centerMicContainer}>
-          {isRecording ? (
-            <View style={styles.waveRow}>
-              {recorderState?.metering !== undefined && [1, 2, 3, 4, 5].map((_, i) => {
-                const db = recorderState.metering;
-                const norm = Math.max(10, Math.min(60, (db + 60) * 1.2));
-                return (
-                  <View 
-                    key={i} 
-                    style={[
-                      styles.waveBar, 
-                      { height: norm + Math.random() * 8, backgroundColor: colors.error }
-                    ]} 
-                  />
-                );
-              })}
-            </View>
-          ) : null}
-
-          <Pressable
-            style={[
-              styles.centerMicButton,
-              isRecording && styles.centerMicButtonRecording
-            ]}
-            onPress={handleToggleRecording}
-            disabled={processingState !== 'idle' && processingState !== 'ready' && processingState !== 'error'}
-          >
-            {processingState === 'transcribing' || processingState === 'translating' || processingState === 'generating-speech' ? (
-              <ActivityIndicator size="small" color="#FFFFFF" />
-            ) : (
-              <Ionicons 
-                name={isRecording ? "stop" : "mic"} 
-                size={32} 
-                color="#FFFFFF" 
-              />
-            )}
-          </Pressable>
-
-          {isRecording && (
-            <Text style={styles.timerText}>
-              00:{elapsedSeconds < 10 ? `0${elapsedSeconds}` : elapsedSeconds}
-            </Text>
-          )}
+        {/* Bottom Light Panel */}
+        <View style={[
+          styles.bottomPanel,
+          lastCompletedTurn && lastCompletedTurn.sourcePanel === 'second' && styles.activePanelGlowLight
+        ]}>
+          {renderSecondPanel()}
         </View>
       </View>
 
@@ -1334,23 +1322,21 @@ const styles = StyleSheet.create({
   },
   mainContent: {
     flex: 1,
-    position: 'relative',
+    flexDirection: 'column',
   },
   topPanel: {
     flex: 1,
     backgroundColor: '#1C1C1E',
-    padding: 24,
-    justifyContent: 'center',
-    alignItems: 'center',
-    borderBottomWidth: 1,
-    borderBottomColor: '#2C2C2E',
+    paddingHorizontal: 20,
+    paddingTop: 16,
+    paddingBottom: 8,
   },
   bottomPanel: {
     flex: 1,
     backgroundColor: '#FFFFFF',
-    padding: 24,
-    justifyContent: 'center',
-    alignItems: 'center',
+    paddingHorizontal: 20,
+    paddingTop: 16,
+    paddingBottom: 8,
   },
   activePanelGlowDark: {
     backgroundColor: '#1E1E24',
@@ -1359,6 +1345,7 @@ const styles = StyleSheet.create({
     backgroundColor: '#FAF9FB',
   },
   emptyPanelContent: {
+    flex: 1,
     alignItems: 'center',
     justifyContent: 'center',
     opacity: 0.8,
@@ -1374,6 +1361,10 @@ const styles = StyleSheet.create({
     color: 'rgba(0, 0, 0, 0.4)',
     textAlign: 'center',
     marginTop: 8,
+  },
+  panelScrollContent: {
+    flexGrow: 1,
+    justifyContent: 'center',
   },
   panelCard: {
     width: '100%',
@@ -1510,29 +1501,40 @@ const styles = StyleSheet.create({
     color: colors.primary,
     textDecorationLine: 'underline',
   },
-  bottomSettingsRow: {
-    position: 'absolute',
-    bottom: 20,
-    left: 20,
-    right: 20,
+  centerControlBar: {
+    height: 90,
+    backgroundColor: colors.surfaceSoft,
+    borderTopWidth: 1,
+    borderBottomWidth: 1,
+    borderColor: colors.border,
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'space-between',
-    backgroundColor: 'rgba(255, 255, 255, 0.9)',
-    borderRadius: 16,
-    padding: 8,
-    shadowColor: '#000',
-    shadowOffset: { width: 0, height: 2 },
-    shadowOpacity: 0.1,
-    shadowRadius: 4,
-    elevation: 3,
-    borderWidth: 1,
-    borderColor: colors.border,
+    paddingHorizontal: 16,
+    zIndex: 10,
+  },
+  leftControlCol: {
+    flexDirection: 'column',
+    gap: 6,
+    width: 85,
+  },
+  rightControlCol: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    width: 95,
+    justifyContent: 'flex-end',
+  },
+  centerMicCol: {
+    alignItems: 'center',
+    justifyContent: 'center',
+    flex: 1,
   },
   settingToggle: {
     flexDirection: 'row',
     alignItems: 'center',
-    gap: 4,
+    justifyContent: 'space-between',
+    width: '100%',
   },
   settingText: {
     fontSize: 10,
@@ -1556,54 +1558,53 @@ const styles = StyleSheet.create({
     color: '#FFFFFF',
   },
   centerMicContainer: {
-    position: 'absolute',
-    top: '50%',
-    left: '50%',
-    transform: [{ translateX: -70 }, { translateY: -78 }],
-    width: 140,
-    height: 140,
-    justifyContent: 'center',
     alignItems: 'center',
-    zIndex: 10,
+    justifyContent: 'center',
   },
   centerMicButton: {
-    width: 76,
-    height: 76,
-    borderRadius: 38,
+    width: 60,
+    height: 60,
+    borderRadius: 30,
     backgroundColor: colors.primary,
     justifyContent: 'center',
     alignItems: 'center',
     shadowColor: '#000',
-    shadowOffset: { width: 0, height: 4 },
-    shadowOpacity: 0.25,
-    shadowRadius: 6,
-    elevation: 8,
-    borderWidth: 3,
+    shadowOffset: { width: 0, height: 3 },
+    shadowOpacity: 0.2,
+    shadowRadius: 4,
+    elevation: 6,
+    borderWidth: 2,
     borderColor: '#FFFFFF',
   },
   centerMicButtonRecording: {
     backgroundColor: colors.error,
   },
   waveRow: {
+    position: 'absolute',
+    top: -30,
     flexDirection: 'row',
     alignItems: 'center',
-    gap: 4,
-    height: 36,
-    marginBottom: 8,
+    gap: 3,
+    height: 24,
   },
   waveBar: {
-    width: 3,
-    borderRadius: 1.5,
+    width: 2.5,
+    borderRadius: 1.25,
+  },
+  timerTextContainer: {
+    position: 'absolute',
+    top: -24,
   },
   timerText: {
-    fontSize: 11,
+    fontSize: 10,
     fontWeight: '700',
-    color: '#FFFFFF',
-    backgroundColor: 'rgba(0,0,0,0.7)',
-    borderRadius: 10,
+    color: colors.textPrimary,
+    backgroundColor: colors.surface,
+    borderWidth: 1,
+    borderColor: colors.border,
+    borderRadius: 8,
     paddingHorizontal: 6,
     paddingVertical: 2,
-    marginTop: 6,
     overflow: 'hidden',
   },
   modalOverlay: {
