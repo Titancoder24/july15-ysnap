@@ -175,9 +175,38 @@ Deno.serve(async (req) => {
 
     const openRouterResult = await response.json();
     const text = openRouterResult.text || "";
+
+    console.log("OpenRouter raw response keys:", Object.keys(openRouterResult));
+    console.log("OpenRouter raw language field:", JSON.stringify(openRouterResult.language));
+    console.log("OpenRouter transcribed text (first 100 chars):", text.substring(0, 100));
     
-    // Normalize language
-    const rawLang = openRouterResult.language;
+    // Normalize language from API response
+    let rawLang = openRouterResult.language || null;
+
+    // Server-side script detection fallback when Whisper doesn't return language
+    if (!rawLang && text) {
+      if (/[\u0B80-\u0BFF]/.test(text)) rawLang = 'tamil';
+      else if (/[\u0C00-\u0C7F]/.test(text)) rawLang = 'telugu';
+      else if (/[\u0C80-\u0CFF]/.test(text)) rawLang = 'kannada';
+      else if (/[\u0D00-\u0D7F]/.test(text)) rawLang = 'malayalam';
+      else if (/[\u0B00-\u0B7F]/.test(text)) rawLang = 'odia';
+      else if (/[\u0980-\u09FF]/.test(text)) rawLang = 'bengali';
+      else if (/[\u0A00-\u0A7F]/.test(text)) rawLang = 'punjabi';
+      else if (/[\u0A80-\u0AFF]/.test(text)) rawLang = 'gujarati';
+      else if (/[\u0900-\u097F]/.test(text)) rawLang = 'hindi';
+      else if (/[\u0600-\u06FF]/.test(text)) rawLang = 'arabic';
+      else if (/[\u0D80-\u0DFF]/.test(text)) rawLang = 'sinhalese';
+      else if (/[\u4E00-\u9FFF]/.test(text)) rawLang = 'chinese';
+      else if (/[\u3040-\u309F\u30A0-\u30FF]/.test(text)) rawLang = 'japanese';
+      else if (/[\uAC00-\uD7AF]/.test(text)) rawLang = 'korean';
+      else if (/[\u0590-\u05FF]/.test(text)) rawLang = 'hebrew';
+      else if (/[\u0E00-\u0E7F]/.test(text)) rawLang = 'thai';
+      
+      if (rawLang) {
+        console.log("Server-side script detection resolved language:", rawLang);
+      }
+    }
+
     const { code: detectedLanguage, name: detectedLanguageName } = normalizeLanguage(rawLang);
     
     const durationSeconds = typeof openRouterResult.duration === 'number' 
