@@ -30,11 +30,37 @@ export default function TextTranslationScreen() {
   
   const [translating, setTranslating] = useState(false);
   const [showTransliterationSheet, setShowTransliterationSheet] = useState(false);
-  const [isBookmarked, setIsBookmarked] = useState(false);
   const [selectedSourceLanguage, setSelectedSourceLanguage] = useState<string | null>(null);
   const [selectedTargetLanguage, setSelectedTargetLanguage] = useState<string | null>(null);
   const [languagePicker, setLanguagePicker] = useState<'source' | 'target' | null>(null);
   const [languageSearch, setLanguageSearch] = useState('');
+
+  // Kanban Study Board states
+  const [selectedColumn, setSelectedColumn] = useState<'to_learn' | 'learning' | 'mastered'>('to_learn');
+  const [editingBookmark, setEditingBookmark] = useState<any | null>(null);
+  const [editTranslatedText, setEditTranslatedText] = useState('');
+  const [editNote, setEditNote] = useState('');
+  const [isSavingEdit, setIsSavingEdit] = useState(false);
+
+  // Fetch all text bookmarks dynamically
+  const { data: bookmarks = [], refetch: refetchBookmarks } = useQuery<any[]>({
+    queryKey: ['homeBookmarks', user?.id],
+    queryFn: async () => {
+      if (!user?.id) return [];
+      const { data, error } = await supabase
+        .from('bookmarks')
+        .select('*')
+        .eq('user_id', user.id)
+        .contains('tags', ['text'])
+        .order('created_at', { ascending: true });
+      if (error) throw error;
+      return data || [];
+    },
+    enabled: !!user?.id,
+  });
+
+  const currentBookmark = bookmarks.find(b => b.translation_item_id === translationResult?.id);
+  const isBookmarked = !!currentBookmark;
 
   // Fetch profile
   const { data: profile } = useQuery<any>({
@@ -74,8 +100,6 @@ export default function TextTranslationScreen() {
     setTranslating(true);
 
     try {
-      // The authenticated Edge Function translates and saves the complete turn
-      // as one server-side operation, including for anonymous demo sessions.
       const { data: translationResultData, error: transError } = await callEdgeFunction<{
         session_id: string;
         translation_item_id: string;
@@ -106,7 +130,6 @@ export default function TextTranslationScreen() {
         alternatives,
         notes,
       });
-      setIsBookmarked(false);
       setTranslating(false);
       Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
       const { data: currentUserData } = await supabase.auth.getUser();
@@ -128,38 +151,175 @@ export default function TextTranslationScreen() {
     Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
 
     try {
-      if (isBookmarked) {
-        // Delete bookmark
+      if (isBookmarked && currentBookmark) {
         const { error } = await supabase
           .from('bookmarks')
           .delete()
-          .eq('user_id', user.id)
-          .eq('translation_item_id', (translationResult as any).id);
+          .eq('id', currentBookmark.id);
         if (error) throw error;
-        setIsBookmarked(false);
       } else {
-        // Create bookmark
         const { error } = await supabase
           .from('bookmarks')
           .insert({
             user_id: user.id,
-            translation_item_id: (translationResult as any).id,
+            translation_item_id: translationResult.id || null,
             source_text: sourceText,
-            translated_text: (translationResult as any).translated,
+            translated_text: translationResult.translated,
             source_language: nativeCode,
             target_language: targetCode,
-            tags: ['text'],
-            note: (translationResult as any).notes,
+            tags: ['text', 'kanban_to_learn'],
+            note: translationResult.notes || '',
           } as any);
         if (error) throw error;
-        setIsBookmarked(true);
-        Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
       }
       queryClient.invalidateQueries({ queryKey: ['homeBookmarks', user.id] });
     } catch (e) {
       console.error(e);
     }
   };
+
+  const handleMoveColumn = async (bookmark: any, direction: 'left' | 'right') => {
+    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
+    let currentStatus = 'to_learn';
+    if (bookmark.tags.includes('kanban_learning')) currentStatus = 'learning';
+    if (bookmark.tags.includes('kanban_mastered')) currentStatus = 'mastered';
+
+    let newStatus = currentStatus;
+    if (direction === 'right') {
+      if (currentStatus === 'to_learn') newStatus = 'learning';
+      else if (currentStatus === 'learning') newStatus = 'mastered';
+    } else {
+      if (currentStatus === 'mastered') newStatus = 'learning';
+      else if (currentStatus === 'learning') newStatus = 'to_learn';
+    }
+
+    if (newStatus === currentStatus) return;
+
+    const cleanTags = bookmark.tags.filter((t: string) => t !== 'text' && !t.startsWith('kanban_'));
+    const newTags = ['text', `kanban_${newStatus}`, ...cleanTags];
+
+    try {
+      const { error } = await supabase
+        .from('bookmarks')
+        .update({ tags: newTags })
+        .eq('id', bookmark.id);
+
+      if (error) throw error;
+      queryClient.invalidateQueries({ queryKey: ['homeBookmarks', user?.id] });
+    } catch (e) {
+      console.error('Error shifting columns:', e);
+    }
+  };
+
+  const handleMoveOrder = async (item: any, direction: 'up' | 'down') => {
+    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
+    
+    const columnItems = bookmarks.filter(b => {
+      let status = 'to_learn';
+      if (b.tags.includes('kanban_learning')) status = 'learning';
+      if (b.tags.includes('kanban_mastered')) status = 'mastered';
+      return status === selectedColumn;
+    });
+
+    const idx = columnItems.findIndex(b => b.id === item.id);
+    if (idx === -1) return;
+
+    let swapItem = null;
+    if (direction === 'up' && idx > 0) {
+      swapItem = columnItems[idx - 1];
+    } else if (direction === 'down' && idx < columnItems.length - 1) {
+      swapItem = columnItems[idx + 1];
+    }
+
+    if (!swapItem) return;
+
+    try {
+      const tempTime = item.created_at;
+      
+      const { error: err1 } = await supabase
+        .from('bookmarks')
+        .update({ created_at: swapItem.created_at })
+        .eq('id', item.id);
+
+      const { error: err2 } = await supabase
+        .from('bookmarks')
+        .update({ created_at: tempTime })
+        .eq('id', swapItem.id);
+
+      if (err1 || err2) throw err1 || err2;
+
+      queryClient.invalidateQueries({ queryKey: ['homeBookmarks', user?.id] });
+    } catch (e) {
+      console.error('Error swapping positions:', e);
+    }
+  };
+
+  const handleDeleteBookmark = async (bookmarkId: string) => {
+    Alert.alert(
+      'Delete Note',
+      'Are you sure you want to remove this saved phrase?',
+      [
+        { text: 'Cancel', style: 'cancel' },
+        {
+          text: 'Delete',
+          style: 'destructive',
+          onPress: async () => {
+            Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+            try {
+              const { error } = await supabase
+                .from('bookmarks')
+                .delete()
+                .eq('id', bookmarkId);
+              if (error) throw error;
+              queryClient.invalidateQueries({ queryKey: ['homeBookmarks', user?.id] });
+            } catch (e) {
+              console.error('Error deleting bookmark:', e);
+            }
+          }
+        }
+      ]
+    );
+  };
+
+  const handleOpenEdit = (bookmark: any) => {
+    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+    setEditingBookmark(bookmark);
+    setEditTranslatedText(bookmark.translated_text || '');
+    setEditNote(bookmark.note || '');
+  };
+
+  const handleSaveEdit = async () => {
+    if (!editingBookmark) return;
+    Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+    setIsSavingEdit(true);
+
+    try {
+      const { error } = await supabase
+        .from('bookmarks')
+        .update({
+          translated_text: editTranslatedText,
+          note: editNote,
+        })
+        .eq('id', editingBookmark.id);
+
+      if (error) throw error;
+      setEditingBookmark(null);
+      queryClient.invalidateQueries({ queryKey: ['homeBookmarks', user?.id] });
+    } catch (e) {
+      console.error('Error editing note:', e);
+      Alert.alert('Error', 'Failed to save changes.');
+    } finally {
+      setIsSavingEdit(false);
+    }
+  };
+
+  const toLearnNotes = bookmarks.filter(b => !b.tags.includes('kanban_learning') && !b.tags.includes('kanban_mastered'));
+  const learningNotes = bookmarks.filter(b => b.tags.includes('kanban_learning'));
+  const masteredNotes = bookmarks.filter(b => b.tags.includes('kanban_mastered'));
+  
+  const currentNotes = selectedColumn === 'to_learn' ? toLearnNotes 
+                     : selectedColumn === 'learning' ? learningNotes 
+                     : masteredNotes;
 
   return (
     <SafeAreaView style={styles.container}>
@@ -278,6 +438,149 @@ export default function TextTranslationScreen() {
               )}
             </View>
           )}
+
+          {/* Kanban Translation Study Board */}
+          {user && (
+            <View style={styles.kanbanSection}>
+              <Text style={styles.sectionHeader}>Translation Study Board</Text>
+              <View style={styles.kanbanTabs}>
+                <Pressable 
+                  style={[styles.kanbanTab, selectedColumn === 'to_learn' && styles.kanbanTabActive]}
+                  onPress={() => {
+                    Haptics.selectionAsync();
+                    setSelectedColumn('to_learn');
+                  }}
+                >
+                  <Text style={[styles.kanbanTabText, selectedColumn === 'to_learn' && styles.kanbanTabTextActive]}>
+                    To Learn ({toLearnNotes.length})
+                  </Text>
+                </Pressable>
+
+                <Pressable 
+                  style={[styles.kanbanTab, selectedColumn === 'learning' && styles.kanbanTabActive]}
+                  onPress={() => {
+                    Haptics.selectionAsync();
+                    setSelectedColumn('learning');
+                  }}
+                >
+                  <Text style={[styles.kanbanTabText, selectedColumn === 'learning' && styles.kanbanTabTextActive]}>
+                    Learning ({learningNotes.length})
+                  </Text>
+                </Pressable>
+
+                <Pressable 
+                  style={[styles.kanbanTab, selectedColumn === 'mastered' && styles.kanbanTabActive]}
+                  onPress={() => {
+                    Haptics.selectionAsync();
+                    setSelectedColumn('mastered');
+                  }}
+                >
+                  <Text style={[styles.kanbanTabText, selectedColumn === 'mastered' && styles.kanbanTabTextActive]}>
+                    Mastered ({masteredNotes.length})
+                  </Text>
+                </Pressable>
+              </View>
+
+              {/* Sticky Notes Grid */}
+              <View style={styles.stickyNotesList}>
+                {currentNotes.length === 0 ? (
+                  <View style={styles.emptyStickyContainer}>
+                    <Ionicons name="documents-outline" size={40} color={colors.textMuted} style={{ marginBottom: 8 }} />
+                    <Text style={styles.emptyStickyText}>No sticky notes here</Text>
+                    <Text style={styles.emptyStickySub}>Translations you save will appear in this column.</Text>
+                  </View>
+                ) : (
+                  currentNotes.map((note, index) => {
+                    const rotAngle = index % 2 === 0 ? '1.5deg' : '-1.5deg';
+                    const noteBg = selectedColumn === 'to_learn' ? '#FFF9C4' 
+                                 : selectedColumn === 'learning' ? '#E3F2FD' 
+                                 : '#E8F5E9';
+
+                    return (
+                      <View 
+                        key={note.id} 
+                        style={[
+                          styles.stickyNote, 
+                          { backgroundColor: noteBg, transform: [{ rotate: rotAngle }] }
+                        ]}
+                      >
+                        <View style={styles.stickyTape} />
+
+                        <View style={styles.stickyHeader}>
+                          <Text style={styles.stickyLangCode}>
+                            {note.source_language.toUpperCase()} → {note.target_language.toUpperCase()}
+                          </Text>
+                          <View style={styles.stickyOrderControls}>
+                            <Pressable 
+                              disabled={index === 0}
+                              onPress={() => handleMoveOrder(note, 'up')}
+                              style={styles.orderArrow}
+                            >
+                              <Ionicons name="chevron-up" size={14} color={index === 0 ? 'rgba(0,0,0,0.2)' : 'rgba(0,0,0,0.6)'} />
+                            </Pressable>
+                            <Pressable 
+                              disabled={index === currentNotes.length - 1}
+                              onPress={() => handleMoveOrder(note, 'down')}
+                              style={styles.orderArrow}
+                            >
+                              <Ionicons name="chevron-down" size={14} color={index === currentNotes.length - 1 ? 'rgba(0,0,0,0.2)' : 'rgba(0,0,0,0.6)'} />
+                            </Pressable>
+                          </View>
+                        </View>
+
+                        <Text style={note.source_text.length > 50 ? styles.stickySourceTextSmall : styles.stickySourceText}>
+                          {note.source_text}
+                        </Text>
+                        <Text style={note.translated_text.length > 50 ? styles.stickyTransTextSmall : styles.stickyTransText}>
+                          {note.translated_text}
+                        </Text>
+
+                        {note.note ? (
+                          <View style={styles.stickyCommentBox}>
+                            <Text style={styles.stickyCommentLabel}>Note:</Text>
+                            <Text style={styles.stickyCommentText}>{note.note}</Text>
+                          </View>
+                        ) : null}
+
+                        <View style={styles.stickyFooter}>
+                          <View style={styles.stickyNavButtons}>
+                            {selectedColumn !== 'to_learn' && (
+                              <Pressable 
+                                style={styles.stickyNavBtn}
+                                onPress={() => handleMoveColumn(note, 'left')}
+                              >
+                                <Ionicons name="chevron-back" size={14} color="rgba(0,0,0,0.6)" />
+                              </Pressable>
+                            )}
+                            <Pressable 
+                              style={styles.stickyActionBtn}
+                              onPress={() => handleOpenEdit(note)}
+                            >
+                              <Ionicons name="pencil" size={12} color="rgba(0,0,0,0.6)" />
+                            </Pressable>
+                            <Pressable 
+                              style={styles.stickyActionBtn}
+                              onPress={() => handleDeleteBookmark(note.id)}
+                            >
+                              <Ionicons name="trash-outline" size={12} color="rgba(0,0,0,0.6)" />
+                            </Pressable>
+                            {selectedColumn !== 'mastered' && (
+                              <Pressable 
+                                style={styles.stickyNavBtn}
+                                onPress={() => handleMoveColumn(note, 'right')}
+                              >
+                                <Ionicons name="chevron-forward" size={14} color="rgba(0,0,0,0.6)" />
+                              </Pressable>
+                            )}
+                          </View>
+                        </View>
+                      </View>
+                    );
+                  })
+                )}
+              </View>
+            </View>
+          )}
         </ScrollView>
       </KeyboardAvoidingView>
 
@@ -348,6 +651,61 @@ export default function TextTranslationScreen() {
                 );
               })}
             </ScrollView>
+          </View>
+        </View>
+      </Modal>
+
+      {/* Edit Sticky Note Modal */}
+      <Modal
+        visible={editingBookmark !== null}
+        transparent
+        animationType="fade"
+        onRequestClose={() => setEditingBookmark(null)}
+      >
+        <View style={styles.editNoteOverlay}>
+          <View style={styles.editNoteCard}>
+            <View style={styles.sheetHeader}>
+              <Text style={styles.sheetTitle}>Edit Sticky Note</Text>
+              <Pressable onPress={() => setEditingBookmark(null)}>
+                <Ionicons name="close" size={22} color={colors.textPrimary} />
+              </Pressable>
+            </View>
+
+            <View style={styles.editForm}>
+              <View style={styles.inputGroup}>
+                <Text style={styles.inputLabel}>TRANSLATED PHRASE</Text>
+                <TextInput
+                  style={styles.editTextInput}
+                  value={editTranslatedText}
+                  onChangeText={setEditTranslatedText}
+                  multiline
+                />
+              </View>
+
+              <View style={styles.inputGroup}>
+                <Text style={styles.inputLabel}>CONTEXT / MEMORY NOTE</Text>
+                <TextInput
+                  style={[styles.editTextInput, { minHeight: 80 }]}
+                  value={editNote}
+                  onChangeText={setEditNote}
+                  placeholder="e.g. Learned at dinner, use in polite situations"
+                  placeholderTextColor={colors.textSubtle}
+                  multiline
+                />
+              </View>
+
+              <Pressable 
+                style={[styles.saveEditBtn, isSavingEdit && { opacity: 0.7 }]} 
+                onPress={handleSaveEdit}
+                disabled={isSavingEdit}
+              >
+                {isSavingEdit ? (
+                  <ActivityIndicator size="small" color={colors.textInverse} />
+                ) : (
+                  <Text style={styles.saveEditBtnText}>Save Sticky Note</Text>
+                )}
+              </Pressable>
+            </View>
           </View>
         </View>
       </Modal>
@@ -633,5 +991,228 @@ const styles = StyleSheet.create({
     fontSize: 12,
     fontFamily: typography.captionMedium.fontFamily,
     color: colors.textMuted,
+  },
+  kanbanSection: {
+    marginTop: 30,
+    marginBottom: 20,
+  },
+  kanbanTabs: {
+    flexDirection: 'row',
+    backgroundColor: colors.surfaceSoft,
+    borderRadius: 12,
+    padding: 4,
+    marginBottom: 20,
+    borderWidth: 1,
+    borderColor: colors.border,
+  },
+  kanbanTab: {
+    flex: 1,
+    paddingVertical: 10,
+    alignItems: 'center',
+    borderRadius: 8,
+  },
+  kanbanTabActive: {
+    backgroundColor: colors.background,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 1 },
+    shadowOpacity: 0.1,
+    shadowRadius: 3,
+    elevation: 1,
+  },
+  kanbanTabText: {
+    fontSize: 13,
+    fontFamily: typography.bodyMedium.fontFamily,
+    color: colors.textMuted,
+  },
+  kanbanTabTextActive: {
+    color: colors.textPrimary,
+    fontFamily: typography.bodySemibold.fontFamily,
+    fontWeight: '700',
+  },
+  stickyNotesList: {
+    gap: 20,
+    paddingBottom: 40,
+  },
+  stickyNote: {
+    borderRadius: 16,
+    padding: 18,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 3 },
+    shadowOpacity: 0.08,
+    shadowRadius: 5,
+    elevation: 3,
+    borderWidth: 1,
+    borderColor: 'rgba(0, 0, 0, 0.05)',
+    position: 'relative',
+    overflow: 'visible',
+  },
+  stickyTape: {
+    position: 'absolute',
+    top: -10,
+    alignSelf: 'center',
+    width: 60,
+    height: 18,
+    backgroundColor: 'rgba(255, 255, 255, 0.5)',
+    borderWidth: 1,
+    borderColor: 'rgba(0, 0, 0, 0.04)',
+    zIndex: 5,
+    transform: [{ rotate: '-3deg' }],
+  },
+  stickyHeader: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginBottom: 12,
+  },
+  stickyLangCode: {
+    fontSize: 10,
+    fontWeight: '700',
+    color: 'rgba(0, 0, 0, 0.4)',
+    letterSpacing: 1,
+  },
+  stickyOrderControls: {
+    flexDirection: 'row',
+    gap: 6,
+  },
+  orderArrow: {
+    padding: 2,
+  },
+  stickySourceText: {
+    fontSize: 16,
+    fontWeight: '700',
+    color: 'rgba(0, 0, 0, 0.8)',
+    fontFamily: typography.bodySemibold.fontFamily,
+    marginBottom: 4,
+  },
+  stickySourceTextSmall: {
+    fontSize: 14,
+    fontWeight: '700',
+    color: 'rgba(0, 0, 0, 0.8)',
+    fontFamily: typography.bodySemibold.fontFamily,
+    marginBottom: 4,
+  },
+  stickyTransText: {
+    fontSize: 18,
+    fontWeight: '800',
+    color: colors.primary,
+    fontFamily: typography.heading3.fontFamily,
+    marginBottom: 12,
+  },
+  stickyTransTextSmall: {
+    fontSize: 15,
+    fontWeight: '800',
+    color: colors.primary,
+    fontFamily: typography.heading3.fontFamily,
+    marginBottom: 12,
+  },
+  stickyCommentBox: {
+    backgroundColor: 'rgba(0, 0, 0, 0.03)',
+    borderRadius: 10,
+    padding: 10,
+    marginBottom: 14,
+    borderWidth: 1,
+    borderColor: 'rgba(0, 0, 0, 0.02)',
+  },
+  stickyCommentLabel: {
+    fontSize: 10,
+    fontWeight: '700',
+    color: 'rgba(0,0,0,0.5)',
+    marginBottom: 2,
+  },
+  stickyCommentText: {
+    fontSize: 12,
+    color: 'rgba(0,0,0,0.7)',
+    lineHeight: 16,
+    fontFamily: typography.body.fontFamily,
+  },
+  stickyFooter: {
+    flexDirection: 'row',
+    justifyContent: 'flex-end',
+    borderTopWidth: 1,
+    borderTopColor: 'rgba(0, 0, 0, 0.05)',
+    paddingTop: 10,
+  },
+  stickyNavButtons: {
+    flexDirection: 'row',
+    gap: 14,
+    alignItems: 'center',
+  },
+  stickyNavBtn: {
+    padding: 4,
+  },
+  stickyActionBtn: {
+    padding: 4,
+  },
+  emptyStickyContainer: {
+    alignItems: 'center',
+    paddingVertical: 40,
+    opacity: 0.6,
+  },
+  emptyStickyText: {
+    fontSize: 15,
+    fontWeight: '700',
+    color: colors.textMuted,
+    marginTop: 10,
+  },
+  emptyStickySub: {
+    fontSize: 12,
+    color: colors.textSubtle,
+    textAlign: 'center',
+    marginTop: 4,
+    paddingHorizontal: 20,
+  },
+  editNoteOverlay: {
+    flex: 1,
+    justifyContent: 'center',
+    alignItems: 'center',
+    backgroundColor: colors.overlay,
+  },
+  editNoteCard: {
+    width: '85%',
+    backgroundColor: colors.background,
+    borderRadius: 20,
+    padding: 20,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 10 },
+    shadowOpacity: 0.25,
+    shadowRadius: 15,
+    elevation: 10,
+  },
+  editForm: {
+    gap: 16,
+    marginTop: 10,
+  },
+  inputGroup: {
+    gap: 6,
+  },
+  inputLabel: {
+    fontSize: 11,
+    fontWeight: '700',
+    color: colors.textMuted,
+    letterSpacing: 1,
+  },
+  editTextInput: {
+    backgroundColor: colors.surfaceSoft,
+    borderWidth: 1,
+    borderColor: colors.border,
+    borderRadius: 12,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+    fontSize: 15,
+    color: colors.textPrimary,
+    textAlignVertical: 'top',
+  },
+  saveEditBtn: {
+    backgroundColor: colors.primary,
+    borderRadius: 12,
+    paddingVertical: 14,
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginTop: 10,
+  },
+  saveEditBtnText: {
+    fontSize: 15,
+    fontWeight: '700',
+    color: colors.textInverse,
   },
 });
