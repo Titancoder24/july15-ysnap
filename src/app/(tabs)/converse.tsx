@@ -9,234 +9,137 @@ import {
   Alert,
   Switch,
   ActivityIndicator,
-  Modal,
   Share,
   Platform,
+  Dimensions,
+  Modal,
+  Clipboard,
 } from 'react-native';
 import { StatusBar } from 'expo-status-bar';
-import * as Haptics from 'expo-haptics';
-import { useRouter } from 'expo-router';
 import { Ionicons } from '@expo/vector-icons';
-import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
-import { useAudioPlayer, AudioModule } from 'expo-audio';
-import { useAppAudioRecorder, useAppAudioRecorderState } from '../../utils/audioRecorder';
+import { useRouter } from 'expo-router';
+import * as Haptics from 'expo-haptics';
 
-import { colors } from '../../constants/colors';
-import { spacing, layout, shadows } from '../../constants/spacing';
-import { typography } from '../../constants/typography';
-import { languages, getLanguageName } from '../../constants/languages';
-import { supabase, callEdgeFunction } from '../../lib/supabase';
+import { colors, spacing, typography } from '../../constants';
+import { supabase } from '../../lib/supabase';
 import { useAuth } from '../../contexts/AuthContext';
+import { useAppAudioRecorder } from '../../utils/audioRecorder';
+import { AudioModule, useAudioPlayer } from 'expo-audio';
 import { elevenLabsService } from '../../services/elevenLabs';
-import { resolveConversationDirection, ConversationTurn } from '../../utils/conversationDirection';
+import { getLanguageName, languages } from '../../constants/languages';
 
-type ConversationProcessingState =
-  | 'idle'
-  | 'requesting-permission'
-  | 'recording'
-  | 'stopping'
-  | 'uploading'
-  | 'transcribing'
-  | 'detecting-language'
-  | 'language-mismatch'
-  | 'translating'
-  | 'generating-speech'
-  | 'ready'
-  | 'error';
+const { width } = Dimensions.get('window');
+
+interface DictationTurn {
+  id: string;
+  text: string;
+  detectedLanguage: string;
+  detectedLanguageName: string;
+  originalAudioUrl?: string;
+  translatedAudioUrl?: string; // TTS playback url
+  createdAt: string;
+}
 
 export default function ConverseTab() {
   const router = useRouter();
   const { user } = useAuth();
-  const queryClient = useQueryClient();
 
-  // Language Setup
-  const [topLanguage, setTopLanguage] = useState('ta'); // Tamil
-  const [bottomLanguage, setBottomLanguage] = useState('en'); // English
-  const [activeLangModal, setActiveLangModal] = useState<'top' | 'bottom' | null>(null);
+  // Media players & recorders
+  const player = useAudioPlayer();
+  const recorder = useAppAudioRecorder();
 
-  // Settings
-  const [isFaceToFace, setIsFaceToFace] = useState(false);
+  // App State
+  const [text, setText] = useState<string>('');
+  const [detectedLangCode, setDetectedLangCode] = useState<string>('');
+  const [detectedLangName, setDetectedLangName] = useState<string>('');
+  
+  const [isRecording, setIsRecording] = useState(false);
+  const [processingState, setProcessingState] = useState<'idle' | 'recording' | 'transcribing' | 'speaking' | 'error'>('idle');
+  const [statusText, setStatusText] = useState('');
+  
+  // Toggles
   const [vadEnabled, setVadEnabled] = useState(true);
   const [autoPlay, setAutoPlay] = useState(true);
 
-  // Conversation States
-  const [isRecording, setIsRecording] = useState(false);
-  const [processingState, setProcessingState] = useState<ConversationProcessingState>('idle');
-  const [statusText, setStatusText] = useState('');
-  
-  const [turns, setTurns] = useState<ConversationTurn[]>([]);
-  const [currentTurnId, setCurrentTurnId] = useState<string | null>(null);
-  const [lastDetectedLanguage, setLastDetectedLanguage] = useState<string | null>(null);
-  
-  // Modals / Overlays
+  // History logs
+  const [turns, setTurns] = useState<DictationTurn[]>([]);
   const [showHistory, setShowHistory] = useState(false);
-  const [mismatchTurn, setMismatchTurn] = useState<ConversationTurn | null>(null);
-  const [tempAudioUri, setTempAudioUri] = useState<string | null>(null);
 
-  const sessionIdRef = useRef<string | null>(null);
-
-  // Audio Recorder & Player setup
-  const recorder = useAppAudioRecorder({
-    isMeteringEnabled: true,
-  });
-  const recorderState = useAppAudioRecorderState(recorder, 100);
-  const player = useAudioPlayer('');
-
-  // VAD state & elapsed timer
+  // VAD Stopwatch / silence detection emulator for client
   const [elapsedSeconds, setElapsedSeconds] = useState(0);
-  const [hasSpoken, setHasSpoken] = useState(false);
-  const silenceFramesRef = useRef(0);
+  const timerRef = useRef<NodeJS.Timeout | null>(null);
 
-  // Fetch profile to get native language
-  const { data: profile } = useQuery<any>({
-    queryKey: ['profile', user?.id],
-    queryFn: async () => {
-      if (!user?.id) return null;
-      const { data } = await supabase.from('profiles').select('*').eq('id', user.id).single();
-      return data;
-    },
-    enabled: !!user?.id,
-  });
+  // Sync profile voice
+  const [profile, setProfile] = useState<any>(null);
 
-  const nativeCode = profile?.native_language || 'en';
-
-  // Stopwatch effect
   useEffect(() => {
-    let interval: any;
+    if (user) {
+      supabase
+        .from('profiles')
+        .select('*')
+        .eq('id', user.id)
+        .single()
+        .then(({ data }) => {
+          if (data) setProfile(data);
+        });
+      
+      // Load history
+      loadHistory();
+    }
+  }, [user]);
+
+  // Recording timer
+  useEffect(() => {
     if (isRecording) {
       setElapsedSeconds(0);
-      interval = setInterval(() => {
-        setElapsedSeconds(prev => prev + 1);
+      timerRef.current = setInterval(() => {
+        setElapsedSeconds(prev => {
+          // Stop recording automatically if it reaches 45 seconds (prevent long runaway audio)
+          if (prev >= 45) {
+            handleToggleRecording();
+            return 45;
+          }
+          return prev + 1;
+        });
       }, 1000);
     } else {
-      setElapsedSeconds(0);
+      if (timerRef.current) {
+        clearInterval(timerRef.current);
+        timerRef.current = null;
+      }
     }
-    return () => clearInterval(interval);
+    return () => {
+      if (timerRef.current) clearInterval(timerRef.current);
+    };
   }, [isRecording]);
 
-  // VAD automatic stop detection
-  useEffect(() => {
-    if (!isRecording || !vadEnabled) {
-      setHasSpoken(false);
-      silenceFramesRef.current = 0;
-      return;
-    }
-
-    const db = recorderState?.metering ?? -60;
-    
-    if (!hasSpoken) {
-      if (db > -35) {
-        setHasSpoken(true);
-      }
-    } else {
-      if (db < -42) {
-        silenceFramesRef.current += 1;
-        // 20 frames of 100ms = 2.0s silence to stop automatically
-        if (silenceFramesRef.current >= 20) {
-          console.log("VAD silence detected, automatically stopping recording.");
-          handleStopRecording();
-        }
-      } else {
-        silenceFramesRef.current = 0;
-      }
-    }
-  }, [recorderState?.metering, isRecording, hasSpoken, vadEnabled]);
-
-  // Fetch bookmarks maps
-  const [bookmarkedIds, setBookmarkedIds] = useState<Record<string, boolean>>({});
-
-  const { data: conversationBookmarks = [] } = useQuery<any[]>({
-    queryKey: ['conversationBookmarks', user?.id],
-    queryFn: async () => {
-      if (!user?.id) return [];
-      const { data, error } = await supabase
-        .from('bookmarks')
-        .select('translation_item_id')
-        .eq('user_id', user.id);
-      if (error) throw error;
-      return data || [];
-    },
-    enabled: !!user?.id,
-  });
-
-  useEffect(() => {
-    const bookmarkedMap: Record<string, boolean> = {};
-    conversationBookmarks.forEach(b => {
-      if (b.translation_item_id) {
-        bookmarkedMap[b.translation_item_id] = true;
-      }
-    });
-    setBookmarkedIds(bookmarkedMap);
-  }, [conversationBookmarks]);
-
-  // Sync session turns from DB on mount or when session ID is set
-  const { data: dbTurns = [], refetch: refetchHistory } = useQuery<any[]>({
-    queryKey: ['conversationTurns', sessionIdRef.current],
-    queryFn: async () => {
-      if (!sessionIdRef.current) return [];
+  const loadHistory = async () => {
+    if (!user) return;
+    try {
       const { data, error } = await supabase
         .from('translation_items')
         .select('*')
-        .eq('session_id', sessionIdRef.current)
-        .order('sequence_number', { ascending: true });
+        .eq('user_id', user.id)
+        .order('created_at', { ascending: false })
+        .limit(20);
+
       if (error) throw error;
-      return data || [];
-    },
-    enabled: !!sessionIdRef.current,
-  });
 
-  useEffect(() => {
-    if (dbTurns && dbTurns.length > 0) {
-      setTurns(dbTurns.map(mapDbRowToTurn));
+      if (data) {
+        const loaded: DictationTurn[] = data.map((row: any) => ({
+          id: row.id,
+          text: row.source_text || '',
+          detectedLanguage: row.detected_language || '',
+          detectedLanguageName: row.detected_language_name || 'English',
+          originalAudioUrl: row.source_audio_path || undefined,
+          translatedAudioUrl: row.generated_audio_path || undefined,
+          createdAt: row.created_at,
+        }));
+        setTurns(loaded);
+      }
+    } catch (e) {
+      console.error("Error loading history:", e);
     }
-  }, [dbTurns]);
-
-  function mapDbRowToTurn(row: any): ConversationTurn {
-    return {
-      id: row.id,
-      sessionId: row.session_id,
-      detectedLanguage: row.detected_language || '',
-      detectedLanguageName: row.detected_language_name || '',
-      sourceLanguage: row.source_language || '',
-      targetLanguage: row.target_language || '',
-      sourcePanel: (row.source_panel as 'first' | 'second' | 'unknown') || 'unknown',
-      originalText: row.source_text || '',
-      translatedText: row.translated_text || '',
-      detectionMode: (row.detection_mode as 'provider' | 'previous-turn-fallback' | 'manual') || 'provider',
-      originalAudioUrl: row.source_audio_path || undefined,
-      translatedAudioUrl: row.generated_audio_path || undefined,
-      createdAt: row.created_at,
-      status: (row.status as 'processing' | 'complete' | 'failed') || 'complete',
-      transcriptionError: row.transcription_error || undefined,
-      translationError: row.translation_error || undefined,
-      speechError: row.speech_error || undefined,
-    };
-  }
-
-  const getOrCreateSession = async () => {
-    if (sessionIdRef.current) return sessionIdRef.current;
-    if (!user) return null;
-    
-    const { data: session, error } = await supabase
-      .from('translation_sessions')
-      .insert({
-        user_id: user.id,
-        status: 'active',
-        metadata: {
-          isFaceToFace,
-          firstLanguage: topLanguage,
-          secondLanguage: bottomLanguage,
-        }
-      } as any)
-      .select()
-      .single();
-
-    if (error) {
-      console.error("Error creating session:", error);
-      throw error;
-    }
-    sessionIdRef.current = session.id;
-    return session.id;
   };
 
   const uploadAudioToStorage = async (localUri: string): Promise<string | null> => {
@@ -273,41 +176,36 @@ export default function ConverseTab() {
     }
   };
 
-  const saveTurnToDb = async (turn: ConversationTurn) => {
+  const saveDictationToDb = async (turn: DictationTurn) => {
     if (!user) return;
     try {
-      const sessionId = await getOrCreateSession();
+      // Insert into translation_items to integrate with the existing database schema
       const { error } = await supabase
         .from('translation_items')
-        .upsert({
+        .insert({
           id: turn.id,
-          session_id: sessionId,
           user_id: user.id,
-          speaker_id: turn.sourcePanel === 'first' ? 'A' : 'B',
+          speaker_id: 'A',
           sequence_number: turns.length + 1,
-          source_text: turn.originalText,
-          translated_text: turn.translatedText || null,
+          source_text: turn.text,
           detected_language: turn.detectedLanguage || null,
           detected_language_name: turn.detectedLanguageName || null,
-          source_language: turn.sourceLanguage,
-          target_language: turn.targetLanguage,
-          source_panel: turn.sourcePanel,
-          detection_mode: turn.detectionMode,
-          status: turn.status,
-          transcription_error: turn.transcriptionError || null,
-          translation_error: turn.translationError || null,
-          speech_error: turn.speechError || null,
+          source_language: turn.detectedLanguage,
+          target_language: turn.detectedLanguage,
+          source_panel: 'first',
+          detection_mode: 'provider',
+          status: 'complete',
           source_audio_path: turn.originalAudioUrl || null,
           generated_audio_path: turn.translatedAudioUrl || null,
           created_at: turn.createdAt,
         } as any);
 
       if (error) {
-        console.error("Error saving turn to db:", error);
+        console.error("Error saving dictation turn:", error);
       }
-      refetchHistory();
+      loadHistory();
     } catch (e) {
-      console.error("Error saving turn:", e);
+      console.error("Error saving dictation:", e);
     }
   };
 
@@ -317,13 +215,13 @@ export default function ConverseTab() {
       return;
     }
 
-    if (processingState !== 'idle' && processingState !== 'ready' && processingState !== 'error') {
+    if (processingState !== 'idle' && processingState !== 'error') {
       return;
     }
 
     Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
 
-    // Stop playback
+    // Stop current playback
     try {
       player.pause();
     } catch (e) {
@@ -353,8 +251,8 @@ export default function ConverseTab() {
     Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
 
     setIsRecording(false);
-    setProcessingState('stopping');
-    setStatusText('Processing audio...');
+    setProcessingState('transcribing');
+    setStatusText('Transcribing speech...');
 
     try {
       const completedUri = await recorder.stop();
@@ -362,7 +260,6 @@ export default function ConverseTab() {
       if (!audioUri) {
         throw new Error('No recorded audio file found.');
       }
-      setTempAudioUri(audioUri);
       await processAudio(audioUri);
     } catch (err: any) {
       console.error(err);
@@ -372,947 +269,364 @@ export default function ConverseTab() {
     }
   };
 
-  const processAudio = async (audioUri: string, languageHint?: string) => {
-    const turnId = Math.random().toString(36).substring(7);
-    setCurrentTurnId(turnId);
-
+  const processAudio = async (audioUri: string) => {
     setProcessingState('transcribing');
-    setStatusText('Processing audio...');
-
-    const newTurn: ConversationTurn = {
-      id: turnId,
-      detectedLanguage: '',
-      detectedLanguageName: '',
-      sourceLanguage: '',
-      targetLanguage: '',
-      sourcePanel: 'unknown',
-      originalText: '',
-      translatedText: '',
-      detectionMode: 'provider',
-      createdAt: new Date().toISOString(),
-      status: 'processing',
-    };
-
-    setTurns(prev => [...prev, newTurn]);
+    setStatusText('Transcribing speech...');
 
     try {
-      // 0. Upload recorded source audio to storage concurrently
-      let sourceAudioUrl: string | null = null;
+      // 1. Upload raw audio file
+      let originalAudioUrl: string | null = null;
       try {
-        sourceAudioUrl = await uploadAudioToStorage(audioUri);
+        originalAudioUrl = await uploadAudioToStorage(audioUri);
       } catch (uploadErr) {
-        console.error("Failed to upload source audio to storage:", uploadErr);
+        console.error("Failed to upload audio file:", uploadErr);
       }
 
-      // 1. Transcribe
-      const result = await elevenLabsService.transcribeAudio(audioUri, languageHint);
+      // 2. Call Speech-to-Text Edge Function
+      const result = await elevenLabsService.transcribeAudio(audioUri);
       if (!result.text || !result.text.trim()) {
-        throw new Error('Empty transcription. Please speak clearly.');
+        throw new Error('Could not capture speech. Please speak clearly and try again.');
       }
 
-      setTurns(prev => prev.map(t => t.id === turnId ? {
-        ...t,
-        originalText: result.text,
-        detectedLanguage: result.detectedLanguage || '',
-        detectedLanguageName: result.detectedLanguageName || '',
-        originalAudioUrl: sourceAudioUrl || undefined
-      } : t));
+      const langCode = result.detectedLanguage || 'en';
+      const langName = result.detectedLanguageName || getLanguageName(langCode);
 
-      // 2. Resolve Direction
-      const resolution = resolveConversationDirection({
-        detectedLanguage: result.detectedLanguage,
-        firstLanguage: topLanguage,
-        secondLanguage: bottomLanguage,
-        previousDetectedLanguage: lastDetectedLanguage,
-        transcript: result.text
-      });
+      setText(result.text);
+      setDetectedLangCode(langCode);
+      setDetectedLangName(langName);
 
-      const updatedTurn: ConversationTurn = {
-        ...newTurn,
-        originalText: result.text,
-        detectedLanguage: result.detectedLanguage || '',
-        detectedLanguageName: result.detectedLanguageName || '',
-        sourceLanguage: resolution.sourceLanguage,
-        targetLanguage: resolution.targetLanguage,
-        sourcePanel: resolution.sourcePanel,
-        detectionMode: resolution.inferredFromPrevious ? 'previous-turn-fallback' : 'provider',
-        originalAudioUrl: sourceAudioUrl || undefined
-      };
-
-      setTurns(prev => prev.map(t => t.id === turnId ? updatedTurn : t));
-
-      if (resolution.status === 'language-mismatch' || resolution.status === 'manual-required') {
-        setMismatchTurn(updatedTurn);
-        setProcessingState('language-mismatch');
-        setStatusText('Language mismatch');
-        return;
-      }
-
-      // Resolved! Translate
-      setProcessingState('translating');
-      setStatusText(`Translating to ${getLanguageName(resolution.targetLanguage)}...`);
-
-      const { data: translationResult, error: transError } = await callEdgeFunction<{
-        translated_text: string;
-      }>('translate-text', {
-        source: resolution.sourceLanguage,
-        target: resolution.targetLanguage,
+      // Create new turn object
+      const newTurn: DictationTurn = {
+        id: Math.random().toString(36).substring(7),
         text: result.text,
-      });
-
-      if (transError || !translationResult) {
-        throw transError || new Error('Failed to translate text.');
-      }
-
-      const translatedText = translationResult.translated_text;
-
-      // Update in state
-      setTurns(prev => prev.map(t => t.id === turnId ? {
-        ...t,
-        translatedText,
-        status: 'complete'
-      } : t));
-
-      // Generate Speech
-      await handleRetrySpeech(turnId, translatedText);
-
-      setLastDetectedLanguage(result.detectedLanguage);
-    } catch (e: any) {
-      console.error(e);
-      setProcessingState('error');
-      setStatusText('Processing failed');
-      setTurns(prev => prev.map(t => t.id === turnId ? {
-        ...t,
-        transcriptionError: e.message || 'Processing failed',
-        status: 'failed'
-      } : t));
-    }
-  };
-
-  const handleRetryTranslation = async (turnId: string) => {
-    const turn = turns.find(t => t.id === turnId);
-    if (!turn) return;
-    
-    setProcessingState('translating');
-    setStatusText(`Translating to ${getLanguageName(turn.targetLanguage)}...`);
-
-    try {
-      const { data: translationResult, error: transError } = await callEdgeFunction<{
-        translated_text: string;
-      }>('translate-text', {
-        source: turn.sourceLanguage,
-        target: turn.targetLanguage,
-        text: turn.originalText,
-      });
-
-      if (transError || !translationResult) {
-        throw transError || new Error('Failed to translate text.');
-      }
-
-      const translatedText = translationResult.translated_text;
-
-      setTurns(prev => prev.map(t => t.id === turnId ? {
-        ...t,
-        translatedText,
-        translationError: undefined,
-        status: 'complete'
-      } : t));
-
-      await handleRetrySpeech(turnId, translatedText);
-    } catch (e: any) {
-      console.error(e);
-      setProcessingState('error');
-      setStatusText('Translation failed');
-      setTurns(prev => prev.map(t => t.id === turnId ? {
-        ...t,
-        translationError: e.message || 'Translation failed'
-      } : t));
-    }
-  };
-
-  const handleRetrySpeech = async (turnId: string, customText?: string) => {
-    const turn = turns.find(t => t.id === turnId);
-    if (!turn) return;
-
-    const textToUse = customText || turn.translatedText;
-    if (!textToUse) return;
-
-    setProcessingState('generating-speech');
-    setStatusText(`Preparing ${getLanguageName(turn.targetLanguage)} voice...`);
-
-    try {
-      const sessionId = await getOrCreateSession();
-      const ttsResult = await elevenLabsService.generateSpeech(
-        textToUse,
-        profile?.selected_voice_id || '21m00Tcm4TlvDq8ikWAM',
-        true,
-        sessionId || undefined
-      );
-
-      if (!ttsResult || !ttsResult.url) {
-        throw new Error('TTS returned empty audio URL');
-      }
-
-      const finalTurn = {
-        ...turn,
-        translatedText: textToUse,
-        translatedAudioUrl: ttsResult.url,
-        speechError: undefined,
-        status: 'complete' as const
+        detectedLanguage: langCode,
+        detectedLanguageName: langName,
+        originalAudioUrl: originalAudioUrl || undefined,
+        createdAt: new Date().toISOString(),
       };
 
-      setTurns(prev => prev.map(t => t.id === turnId ? finalTurn : t));
-      await saveTurnToDb(finalTurn);
+      setTurns(prev => [newTurn, ...prev]);
 
-      setProcessingState('ready');
-      setStatusText('Ready');
+      // 3. Generate voice play-back in native language if autoPlay is enabled
+      let translatedAudioUrl = '';
+      if (autoPlay) {
+        setProcessingState('speaking');
+        setStatusText(`Playing back text...`);
+        try {
+          const ttsResult = await elevenLabsService.generateSpeech(
+            result.text,
+            profile?.selected_voice_id || '21m00Tcm4TlvDq8ikWAM',
+            true
+          );
+          if (ttsResult && ttsResult.url) {
+            translatedAudioUrl = ttsResult.url;
+            newTurn.translatedAudioUrl = ttsResult.url;
+            
+            player.replace({ uri: ttsResult.url });
+            player.play();
+          }
+        } catch (ttsErr) {
+          console.error("TTS playback failed:", ttsErr);
+        }
+      }
 
-      if (autoPlay && ttsResult.url) {
+      // 4. Save turn to database
+      await saveDictationToDb(newTurn);
+
+      setProcessingState('idle');
+      setStatusText('');
+    } catch (e: any) {
+      console.error(e);
+      setProcessingState('error');
+      setStatusText('Transcription failed');
+      Alert.alert('Transcription Failed', e.message || 'Speech could not be transcribed.');
+    }
+  };
+
+  const handleCopyText = async () => {
+    if (!text) return;
+    Clipboard.setString(text);
+    Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+    Alert.alert('Copied', 'Transcribed text copied to clipboard.');
+  };
+
+  const handleShareText = async () => {
+    if (!text) return;
+    try {
+      await Share.share({
+        message: text,
+      });
+    } catch (e) {
+      console.error("Error sharing text:", e);
+    }
+  };
+
+  const handlePlayTTS = async () => {
+    if (!text) return;
+    setProcessingState('speaking');
+    setStatusText('Generating audio speech...');
+    try {
+      const ttsResult = await elevenLabsService.generateSpeech(
+        text,
+        profile?.selected_voice_id || '21m00Tcm4TlvDq8ikWAM',
+        true
+      );
+      if (ttsResult && ttsResult.url) {
         player.replace({ uri: ttsResult.url });
         player.play();
       }
-    } catch (e: any) {
-      console.error(e);
-      setProcessingState('error');
-      setStatusText('Voice generation failed');
-      
-      const failedTurn = {
-        ...turn,
-        translatedText: textToUse,
-        speechError: e.message || 'TTS generation failed',
-        status: 'failed' as const
-      };
-
-      setTurns(prev => prev.map(t => t.id === turnId ? failedTurn : t));
-      await saveTurnToDb(failedTurn);
-    }
-  };
-
-  const handleManualDirectionResolve = async (
-    turnId: string,
-    sourceLanguage: string,
-    targetLanguage: string,
-    sourcePanel: 'first' | 'second'
-  ) => {
-    const turn = turns.find(t => t.id === turnId);
-    if (!turn) return;
-
-    const updatedTurn: ConversationTurn = {
-      ...turn,
-      sourceLanguage,
-      targetLanguage,
-      sourcePanel,
-      detectionMode: 'manual',
-    };
-
-    setTurns(prev => prev.map(t => t.id === turnId ? updatedTurn : t));
-    setMismatchTurn(null);
-
-    setProcessingState('translating');
-    setStatusText(`Translating to ${getLanguageName(targetLanguage)}...`);
-    try {
-      const { data: translationResult, error: transError } = await callEdgeFunction<{
-        translated_text: string;
-      }>('translate-text', {
-        source: sourceLanguage,
-        target: targetLanguage,
-        text: turn.originalText,
-      });
-
-      if (transError || !translationResult) {
-        throw transError || new Error('Failed to translate text.');
-      }
-
-      const translatedText = translationResult.translated_text;
-
-      const nextTurnState = {
-        ...updatedTurn,
-        translatedText,
-        status: 'complete' as const,
-      };
-
-      setTurns(prev => prev.map(t => t.id === turnId ? nextTurnState : t));
-      await handleRetrySpeech(turnId, translatedText);
-      setLastDetectedLanguage(sourceLanguage);
-    } catch (e: any) {
-      console.error(e);
-      setProcessingState('error');
-      setStatusText('Translation failed');
-      setTurns(prev => prev.map(t => t.id === turnId ? {
-        ...t,
-        translationError: e.message || 'Translation failed',
-        status: 'failed'
-      } : t));
-    }
-  };
-
-  const handleRetranscribeWithHint = async (turnId: string, languageHint: string) => {
-    const turn = turns.find(t => t.id === turnId);
-    if (!turn || !tempAudioUri) return;
-
-    setMismatchTurn(null);
-    setProcessingState('transcribing');
-    setStatusText(`Retranscribing using ${getLanguageName(languageHint)} hint...`);
-
-    try {
-      const result = await elevenLabsService.transcribeAudio(tempAudioUri, languageHint);
-      if (!result.text || !result.text.trim()) {
-        throw new Error('Retranscription returned empty text');
-      }
-
-      const resolution = resolveConversationDirection({
-        detectedLanguage: result.detectedLanguage || languageHint,
-        firstLanguage: topLanguage,
-        secondLanguage: bottomLanguage,
-        previousDetectedLanguage: lastDetectedLanguage,
-        transcript: result.text
-      });
-
-      const updatedTurn: ConversationTurn = {
-        ...turn,
-        originalText: result.text,
-        detectedLanguage: result.detectedLanguage || languageHint,
-        detectedLanguageName: result.detectedLanguageName || getLanguageName(result.detectedLanguage || languageHint),
-        status: 'processing',
-      };
-
-      setTurns(prev => prev.map(t => t.id === turnId ? updatedTurn : t));
-
-      if (resolution.status === 'language-mismatch' || resolution.status === 'manual-required') {
-        setMismatchTurn(updatedTurn);
-        setProcessingState('language-mismatch');
-      } else {
-        await handleManualDirectionResolve(
-          turnId, 
-          resolution.sourceLanguage, 
-          resolution.targetLanguage, 
-          resolution.sourcePanel as 'first' | 'second'
-        );
-      }
-    } catch (e: any) {
-      console.error(e);
-      setProcessingState('error');
-      setStatusText('Retranscription failed');
-      Alert.alert('Retranscription Error', e.message || 'Could not retranscribe audio.');
-    }
-  };
-
-  const handleSwapLanguages = () => {
-    Haptics.selectionAsync();
-    const temp = topLanguage;
-    setTopLanguage(bottomLanguage);
-    setBottomLanguage(temp);
-  };
-
-  const selectLanguage = (code: string) => {
-    Haptics.selectionAsync();
-    if (activeLangModal === 'top') {
-      setTopLanguage(code);
-    } else if (activeLangModal === 'bottom') {
-      setBottomLanguage(code);
-    }
-    setActiveLangModal(null);
-  };
-
-  const handleToggleBookmark = async (turn: ConversationTurn) => {
-    if (!user) {
-      Alert.alert('Sign in Required', 'Bookmarking translations is only available for registered users.');
-      return;
-    }
-    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
-    
-    const isAlreadyBookmarked = bookmarkedIds[turn.id];
-    try {
-      if (isAlreadyBookmarked) {
-        const { error } = await supabase
-          .from('bookmarks')
-          .delete()
-          .eq('user_id', user.id)
-          .eq('translation_item_id', turn.id);
-        if (error) throw error;
-        setBookmarkedIds(prev => ({ ...prev, [turn.id]: false }));
-      } else {
-        const { error } = await supabase
-          .from('bookmarks')
-          .insert({
-            user_id: user.id,
-            translation_item_id: turn.id,
-            source_text: turn.originalText,
-            translated_text: turn.translatedText,
-            source_language: turn.sourceLanguage,
-            target_language: turn.targetLanguage,
-            tags: ['conversation'],
-            note: turn.detectedLanguageName ? `Detected: ${turn.detectedLanguageName}` : '',
-          } as any);
-        if (error) throw error;
-        setBookmarkedIds(prev => ({ ...prev, [turn.id]: true }));
-        Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
-      }
     } catch (e) {
-      console.error("Error toggling bookmark:", e);
+      console.error("TTS generation error:", e);
+      Alert.alert('Playback Failed', 'Could not synthesize voice playback.');
+    } finally {
+      setProcessingState('idle');
     }
   };
 
-  const handleShareTurn = async (turn: ConversationTurn) => {
-    try {
-      await Share.share({
-        message: `Original (${getLanguageName(turn.sourceLanguage)}): ${turn.originalText}\nTranslation (${getLanguageName(turn.targetLanguage)}): ${turn.translatedText}`,
-      });
-    } catch (e) {
-      console.error("Error sharing turn:", e);
-    }
-  };
-
-  const handleCopyTurn = async (turn: ConversationTurn) => {
-    await Share.share({
-      message: turn.translatedText
-    });
-  };
-
-  const handleResetSession = () => {
-    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Heavy);
-    Alert.alert(
-      'Clear Conversation',
-      'Are you sure you want to clear current logs and start fresh?',
-      [
-        { text: 'Cancel', style: 'cancel' },
-        {
-          text: 'Clear',
-          style: 'destructive',
-          onPress: () => {
-            setTurns([]);
-            setLastDetectedLanguage(null);
-            sessionIdRef.current = null;
-            setProcessingState('idle');
-            setStatusText('');
-          }
-        }
-      ]
-    );
-  };
-
-  const handleFinishSession = async () => {
-    if (turns.length === 0) {
-      Alert.alert('Empty Session', 'Record some conversation before finishing.');
-      return;
-    }
-
-    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
-    Alert.alert(
-      'Finish Conversation',
-      'Would you like to complete this session and view summary analysis?',
-      [
-        { text: 'Cancel', style: 'cancel' },
-        {
-          text: 'Finish & View Summary',
-          onPress: async () => {
-            if (sessionIdRef.current) {
-              await supabase
-                .from('translation_sessions')
-                .update({ status: 'completed' } as any)
-                .eq('id', sessionIdRef.current);
-              
-              router.push(`/conversation-summary?sessionId=${sessionIdRef.current}`);
-            } else {
-              router.back();
-            }
-          }
-        }
-      ]
-    );
-  };
-
-  const lastCompletedTurn = [...turns].reverse().find(t => t.status === 'complete' || t.status === 'failed');
-
-  const renderFirstPanel = () => {
-    if (processingState === 'transcribing' || processingState === 'detecting-language') {
-      return (
-        <View style={styles.emptyPanelContent}>
-          <ActivityIndicator size="large" color="#FFFFFF" />
-          <Text style={[styles.emptyPanelTextDark, { marginTop: 12 }]}>{statusText}</Text>
-        </View>
-      );
-    }
-
-    if (!lastCompletedTurn) {
-      return (
-        <View style={styles.emptyPanelContent}>
-          <Ionicons name="mic-outline" size={36} color="rgba(255, 255, 255, 0.3)" />
-          <Text style={styles.emptyPanelTextDark}>Speak {getLanguageName(topLanguage)} or {getLanguageName(bottomLanguage)}</Text>
-        </View>
-      );
-    }
-
-    const isSource = lastCompletedTurn.sourcePanel === 'first';
-    
-    return (
-      <ScrollView contentContainerStyle={styles.panelScrollContent} showsVerticalScrollIndicator={false}>
-        {isSource ? (
-          <View style={styles.panelCard}>
-            <View style={styles.panelCardHeader}>
-              <Text style={styles.panelCardLangDark}>{getLanguageName(topLanguage).toUpperCase()}</Text>
-              {lastCompletedTurn.detectedLanguageName && (
-                <Text style={styles.panelCardDetectedDark}>({lastCompletedTurn.detectedLanguageName})</Text>
-              )}
-            </View>
-            <Text style={styles.panelCardTextDark}>{lastCompletedTurn.originalText}</Text>
-          </View>
-        ) : (
-          lastCompletedTurn.translationError ? (
-            <View style={styles.errorCard}>
-              <Ionicons name="warning" size={24} color={colors.error} style={{ marginBottom: 8 }} />
-              <Text style={styles.errorCardTextDark}>Translation failed</Text>
-              <Pressable style={styles.retryBtnDark} onPress={() => handleRetryTranslation(lastCompletedTurn.id)}>
-                <Ionicons name="refresh" size={14} color="#FFFFFF" style={{ marginRight: 4 }} />
-                <Text style={styles.retryBtnTextDark}>Retry translation</Text>
-              </Pressable>
-            </View>
-          ) : (
-            <View style={styles.panelCard}>
-              <View style={styles.panelCardHeader}>
-                <Text style={styles.panelCardLangDark}>{getLanguageName(topLanguage).toUpperCase()}</Text>
-                {lastCompletedTurn.translatedAudioUrl && (
-                  <Pressable 
-                    style={styles.speakerIconDark} 
-                    onPress={() => {
-                      player.replace({ uri: lastCompletedTurn.translatedAudioUrl });
-                      player.play();
-                    }}
-                  >
-                    <Ionicons name="volume-medium" size={22} color="#FFFFFF" />
-                  </Pressable>
-                )}
-              </View>
-              <Text style={styles.panelCardTextDarkTranslated}>{lastCompletedTurn.translatedText}</Text>
-              {lastCompletedTurn.speechError && (
-                <View style={styles.errorRow}>
-                  <Text style={styles.errorSubTextDark}>Voice generation failed</Text>
-                  <Pressable style={styles.retryTextBtn} onPress={() => handleRetrySpeech(lastCompletedTurn.id)}>
-                    <Text style={styles.retryTextBtnTxt}>Retry voice</Text>
-                  </Pressable>
-                </View>
-              )}
-            </View>
-          )
-        )}
-      </ScrollView>
-    );
-  };
-
-  const renderSecondPanel = () => {
-    if (processingState === 'translating' || processingState === 'generating-speech') {
-      return (
-        <View style={styles.emptyPanelContent}>
-          <ActivityIndicator size="large" color={colors.primary} />
-          <Text style={[styles.emptyPanelTextLight, { marginTop: 12 }]}>{statusText}</Text>
-        </View>
-      );
-    }
-
-    if (!lastCompletedTurn) {
-      return (
-        <View style={styles.emptyPanelContent}>
-          <Ionicons name="sparkles-outline" size={36} color="rgba(0, 0, 0, 0.25)" />
-          <Text style={styles.emptyPanelTextLight}>Language is detected automatically</Text>
-        </View>
-      );
-    }
-
-    const isSource = lastCompletedTurn.sourcePanel === 'second';
-
-    return (
-      <ScrollView contentContainerStyle={styles.panelScrollContent} showsVerticalScrollIndicator={false}>
-        {isSource ? (
-          <View style={styles.panelCard}>
-            <View style={styles.panelCardHeader}>
-              <Text style={styles.panelCardLangLight}>{getLanguageName(bottomLanguage).toUpperCase()}</Text>
-              {lastCompletedTurn.detectedLanguageName && (
-                <Text style={styles.panelCardDetectedLight}>({lastCompletedTurn.detectedLanguageName})</Text>
-              )}
-            </View>
-            <Text style={styles.panelCardTextLight}>{lastCompletedTurn.originalText}</Text>
-          </View>
-        ) : (
-          lastCompletedTurn.translationError ? (
-            <View style={styles.errorCard}>
-              <Ionicons name="warning" size={24} color={colors.error} style={{ marginBottom: 8 }} />
-              <Text style={styles.errorCardTextLight}>Translation failed</Text>
-              <Pressable style={styles.retryBtnLight} onPress={() => handleRetryTranslation(lastCompletedTurn.id)}>
-                <Ionicons name="refresh" size={14} color={colors.textPrimary} style={{ marginRight: 4 }} />
-                <Text style={styles.retryBtnTextLight}>Retry translation</Text>
-              </Pressable>
-            </View>
-          ) : (
-            <View style={styles.panelCard}>
-              <View style={styles.panelCardHeader}>
-                <Text style={styles.panelCardLangLight}>{getLanguageName(bottomLanguage).toUpperCase()}</Text>
-                {lastCompletedTurn.translatedAudioUrl && (
-                  <Pressable 
-                    style={styles.speakerIconLight} 
-                    onPress={() => {
-                      player.replace({ uri: lastCompletedTurn.translatedAudioUrl });
-                      player.play();
-                    }}
-                  >
-                    <Ionicons name="volume-medium" size={22} color={colors.textPrimary} />
-                  </Pressable>
-                )}
-              </View>
-              <Text style={styles.panelCardTextLightTranslated}>{lastCompletedTurn.translatedText}</Text>
-              {lastCompletedTurn.speechError && (
-                <View style={styles.errorRow}>
-                  <Text style={styles.errorSubTextLight}>Voice generation failed</Text>
-                  <Pressable style={styles.retryTextBtn} onPress={() => handleRetrySpeech(lastCompletedTurn.id)}>
-                    <Text style={styles.retryTextBtnTxt}>Retry voice</Text>
-                  </Pressable>
-                </View>
-              )}
-            </View>
-          )
-        )}
-      </ScrollView>
-    );
+  const handleClearText = () => {
+    Haptics.selectionAsync();
+    setText('');
+    setDetectedLangCode('');
+    setDetectedLangName('');
+    setProcessingState('idle');
+    setStatusText('');
   };
 
   return (
     <SafeAreaView style={styles.container}>
-      <StatusBar style="dark" />
+      <StatusBar style="light" />
 
       {/* Header */}
       <View style={styles.header}>
         <Pressable style={styles.headerBtn} onPress={() => router.back()}>
-          <Ionicons name="arrow-back" size={24} color={colors.textPrimary} />
+          <Ionicons name="arrow-back" size={24} color="#FFFFFF" />
         </Pressable>
-
-        <View style={styles.headerLangContainer}>
-          <Pressable 
-            style={[styles.headerLangSelector, topLanguage === nativeCode && styles.meSelector]} 
-            onPress={() => setActiveLangModal('top')}
-          >
-            <Text style={styles.headerLangText}>{getLanguageName(topLanguage)}</Text>
-            {topLanguage === nativeCode && (
-              <View style={styles.meBadge}>
-                <Text style={styles.meBadgeText}>Me</Text>
-              </View>
-            )}
-          </Pressable>
-
-          <Pressable style={styles.headerSwapBtn} onPress={handleSwapLanguages}>
-            <Ionicons name="swap-horizontal" size={16} color={colors.primary} />
-          </Pressable>
-
-          <Pressable 
-            style={[styles.headerLangSelector, bottomLanguage === nativeCode && styles.meSelector]} 
-            onPress={() => setActiveLangModal('bottom')}
-          >
-            <Text style={styles.headerLangText}>{getLanguageName(bottomLanguage)}</Text>
-            {bottomLanguage === nativeCode && (
-              <View style={styles.meBadge}>
-                <Text style={styles.meBadgeText}>Me</Text>
-              </View>
-            )}
-          </Pressable>
-        </View>
-
+        <Text style={styles.headerTitle}>YSnap dictation</Text>
         <Pressable style={styles.headerBtn} onPress={() => setShowHistory(true)}>
-          <Ionicons name="time" size={24} color={colors.textPrimary} />
+          <Ionicons name="time-outline" size={24} color="#FFFFFF" />
         </Pressable>
       </View>
 
-      {/* Main content panels */}
-      <View style={styles.mainContent}>
-        {/* Top Dark Panel */}
-        <View style={[
-          styles.topPanel,
-          lastCompletedTurn && lastCompletedTurn.sourcePanel === 'first' && styles.activePanelGlowDark
-        ]}>
-          {renderFirstPanel()}
+      <ScrollView contentContainerStyle={styles.scrollContainer} keyboardShouldPersistTaps="handled">
+        {/* Editor Board Card */}
+        <View style={styles.dictationBoard}>
+          {/* Detected Language Indicator Banner */}
+          {detectedLangName ? (
+            <View style={styles.detectedBadgeRow}>
+              <Ionicons name="earth" size={16} color={colors.accentBlue} style={{ marginRight: 6 }} />
+              <Text style={styles.detectedBadgeText}>Detected Language: <Text style={{ color: colors.accentBlue, fontWeight: '700' }}>{detectedLangName}</Text></Text>
+            </View>
+          ) : (
+            <View style={styles.detectedBadgeRow}>
+              <Ionicons name="sparkles" size={16} color="rgba(255, 255, 255, 0.4)" style={{ marginRight: 6 }} />
+              <Text style={styles.detectedBadgePlaceholder}>Auto-detecting voice language...</Text>
+            </View>
+          )}
+
+          {/* Text Area */}
+          <ScrollView 
+            style={styles.textContainer}
+            contentContainerStyle={styles.textScrollContent}
+            showsVerticalScrollIndicator={true}
+          >
+            {processingState === 'transcribing' ? (
+              <View style={styles.loadingContainer}>
+                <ActivityIndicator size="large" color={colors.accentBlue} />
+                <Text style={styles.loadingText}>{statusText}</Text>
+              </View>
+            ) : text ? (
+              <Text style={styles.dictatedText}>{text}</Text>
+            ) : (
+              <Text style={styles.placeholderText}>
+                Speak in Tamil, English, Hindi, Kannada, Telugu, Malayalam, Japanese, Spanish, or any other majority language. 
+                {"\n\n"}YSnap will auto-verify the voice, transcribe the text instantly, and log it in its original language.
+              </Text>
+            )}
+          </ScrollView>
+
+          {/* Editor Action Buttons */}
+          {text ? (
+            <View style={styles.boardActionsRow}>
+              <Pressable style={styles.boardActionBtn} onPress={handleCopyText}>
+                <Ionicons name="copy-outline" size={18} color="#FFFFFF" />
+                <Text style={styles.boardActionTxt}>Copy</Text>
+              </Pressable>
+
+              <Pressable style={styles.boardActionBtn} onPress={handleShareText}>
+                <Ionicons name="share-outline" size={18} color="#FFFFFF" />
+                <Text style={styles.boardActionTxt}>Share</Text>
+              </Pressable>
+
+              <Pressable style={styles.boardActionBtn} onPress={handlePlayTTS}>
+                <Ionicons name="volume-medium-outline" size={18} color="#FFFFFF" />
+                <Text style={styles.boardActionTxt}>Speak</Text>
+              </Pressable>
+
+              <Pressable style={[styles.boardActionBtn, { backgroundColor: 'rgba(239, 83, 80, 0.2)' }]} onPress={handleClearText}>
+                <Ionicons name="trash-outline" size={18} color={colors.error} />
+                <Text style={[styles.boardActionTxt, { color: colors.error }]}>Clear</Text>
+              </Pressable>
+            </View>
+          ) : null}
         </View>
 
-        {/* Center Control Strip (Inline, Non-overlapped) */}
-        <View style={styles.centerControlBar}>
-          {/* Left Column: settings toggles */}
-          <View style={styles.leftControlCol}>
-            <View style={styles.settingToggle}>
-              <Text style={styles.settingText}>VAD</Text>
+        {/* Live Orb & Voice Controller Strip */}
+        <View style={styles.micControlCard}>
+          {/* Left Settings switches */}
+          <View style={styles.micSettings}>
+            <View style={styles.toggleRow}>
+              <Text style={styles.toggleLabel}>VAD Auto-stop</Text>
               <Switch
                 value={vadEnabled}
                 onValueChange={setVadEnabled}
-                thumbColor={colors.primary}
-                trackColor={{ true: colors.primary, false: colors.borderStrong }}
-                style={{ transform: [{ scaleX: 0.75 }, { scaleY: 0.75 }] }}
+                thumbColor={colors.accentBlue}
+                trackColor={{ true: colors.accentBlue, false: 'rgba(255, 255, 255, 0.1)' }}
+                style={{ transform: [{ scaleX: 0.8 }, { scaleY: 0.8 }] }}
               />
             </View>
-
-            <View style={styles.settingToggle}>
-              <Text style={styles.settingText}>Play</Text>
+            <View style={styles.toggleRow}>
+              <Text style={styles.toggleLabel}>Voice Readback</Text>
               <Switch
                 value={autoPlay}
                 onValueChange={setAutoPlay}
-                thumbColor={colors.primary}
-                trackColor={{ true: colors.primary, false: colors.borderStrong }}
-                style={{ transform: [{ scaleX: 0.75 }, { scaleY: 0.75 }] }}
+                thumbColor={colors.accentBlue}
+                trackColor={{ true: colors.accentBlue, false: 'rgba(255, 255, 255, 0.1)' }}
+                style={{ transform: [{ scaleX: 0.8 }, { scaleY: 0.8 }] }}
               />
             </View>
           </View>
 
-          {/* Center Column: The circular mic button with elapsed time */}
-          <View style={styles.centerMicCol}>
-            {isRecording ? (
-              <View style={styles.timerTextContainer}>
+          {/* Central Pulsing Microphone Button */}
+          <View style={styles.micOrbContainer}>
+            {isRecording && (
+              <View style={styles.timerWrapper}>
                 <Text style={styles.timerText}>
                   00:{elapsedSeconds < 10 ? `0${elapsedSeconds}` : elapsedSeconds}
                 </Text>
               </View>
-            ) : null}
+            )}
 
             <Pressable
               style={[
-                styles.centerMicButton,
-                isRecording && styles.centerMicButtonRecording
+                styles.micOrb,
+                isRecording && styles.micOrbRecording,
+                processingState === 'transcribing' && styles.micOrbProcessing
               ]}
               onPress={handleToggleRecording}
-              disabled={processingState !== 'idle' && processingState !== 'recording' && processingState !== 'ready' && processingState !== 'error'}
             >
-              {processingState === 'transcribing' || processingState === 'translating' || processingState === 'generating-speech' ? (
+              {processingState === 'transcribing' || processingState === 'speaking' ? (
                 <ActivityIndicator size="small" color="#FFFFFF" />
               ) : (
                 <Ionicons 
-                  name={isRecording ? "stop" : "mic"} 
-                  size={28} 
+                  name={isRecording ? "square" : "mic"} 
+                  size={32} 
                   color="#FFFFFF" 
                 />
               )}
             </Pressable>
+            
+            <Text style={styles.micStatusLabel}>
+              {isRecording ? 'TAP TO COMPLETE' : 'TAP TO RECORD'}
+            </Text>
           </View>
 
-          {/* Right Column: session utilities (Clear & Finish) */}
-          <View style={styles.rightControlCol}>
-            <Pressable style={styles.actionBtnIcon} onPress={handleResetSession}>
-              <Ionicons name="trash-outline" size={18} color={colors.error} />
-            </Pressable>
-
-            <Pressable style={styles.actionBtnText} onPress={handleFinishSession}>
-              <Text style={styles.actionBtnTextTxt}>Finish</Text>
-            </Pressable>
+          {/* Right helper info */}
+          <View style={styles.infoCol}>
+            <Ionicons name="mic-circle" size={32} color={isRecording ? colors.accentBlue : 'rgba(255, 255, 255, 0.2)'} />
           </View>
         </View>
+      </ScrollView>
 
-        {/* Bottom Light Panel */}
-        <View style={[
-          styles.bottomPanel,
-          lastCompletedTurn && lastCompletedTurn.sourcePanel === 'second' && styles.activePanelGlowLight
-        ]}>
-          {renderSecondPanel()}
-        </View>
-      </View>
-
-      {/* Language Picker Modal */}
-      <Modal
-        visible={activeLangModal !== null}
-        animationType="slide"
-        transparent={true}
-        onRequestClose={() => setActiveLangModal(null)}
-      >
-        <View style={styles.modalOverlay}>
-          <View style={styles.modalContainer}>
-            <View style={styles.modalHeader}>
-              <Text style={styles.modalTitle}>Choose Language</Text>
-              <Pressable onPress={() => setActiveLangModal(null)} style={styles.modalCloseBtn}>
-                <Ionicons name="close" size={24} color={colors.textPrimary} />
-              </Pressable>
-            </View>
-            <ScrollView style={styles.languagesList} showsVerticalScrollIndicator={false}>
-              {languages.map((lang) => (
-                <Pressable
-                  key={lang.code}
-                  style={styles.languageItem}
-                  onPress={() => selectLanguage(lang.code)}
-                >
-                  <Text style={styles.languageItemText}>{lang.name}</Text>
-                  <Text style={styles.languageItemNative}>{lang.nativeName}</Text>
-                </Pressable>
-              ))}
-            </ScrollView>
-          </View>
-        </View>
-      </Modal>
-
-      {/* Language Mismatch Modal */}
-      {mismatchTurn && (
-        <Modal
-          visible={mismatchTurn !== null}
-          transparent={true}
-          animationType="fade"
-        >
-          <View style={styles.mismatchOverlay}>
-            <View style={styles.mismatchCard}>
-              <Ionicons name="alert-circle" size={40} color={colors.warning} style={{ marginBottom: 12 }} />
-              <Text style={styles.mismatchTitle}>{mismatchTurn.detectedLanguageName || 'Unknown Language'} Detected</Text>
-              <Text style={styles.mismatchSubtitle}>
-                Whisper detected "{mismatchTurn.detectedLanguageName}" which does not match your active pair ({getLanguageName(topLanguage)} ↔ {getLanguageName(bottomLanguage)}).
-              </Text>
-
-              <ScrollView contentContainerStyle={styles.mismatchActions} style={{ maxHeight: 280 }}>
-                <Pressable 
-                  style={styles.mismatchBtnPrimary}
-                  onPress={() => {
-                    const detectedCode = mismatchTurn.detectedLanguage;
-                    if (detectedCode) {
-                      setBottomLanguage(detectedCode);
-                      handleManualDirectionResolve(mismatchTurn.id, detectedCode, topLanguage, 'second');
-                    }
-                  }}
-                >
-                  <Text style={styles.mismatchBtnPrimaryText}>Replace {getLanguageName(bottomLanguage)} with {mismatchTurn.detectedLanguageName}</Text>
-                </Pressable>
-
-                <Pressable 
-                  style={styles.mismatchBtnSecondary}
-                  onPress={() => handleManualDirectionResolve(mismatchTurn.id, topLanguage, bottomLanguage, 'first')}
-                >
-                  <Text style={styles.mismatchBtnSecondaryText}>Treat as {getLanguageName(topLanguage)}</Text>
-                </Pressable>
-
-                <Pressable 
-                  style={styles.mismatchBtnSecondary}
-                  onPress={() => handleManualDirectionResolve(mismatchTurn.id, bottomLanguage, topLanguage, 'second')}
-                >
-                  <Text style={styles.mismatchBtnSecondaryText}>Treat as {getLanguageName(bottomLanguage)}</Text>
-                </Pressable>
-
-                <Pressable 
-                  style={styles.mismatchBtnSecondary}
-                  onPress={() => handleRetranscribeWithHint(mismatchTurn.id, topLanguage)}
-                >
-                  <Text style={styles.mismatchBtnSecondaryText}>Retranscribe using {getLanguageName(topLanguage)} hint</Text>
-                </Pressable>
-
-                <Pressable 
-                  style={styles.mismatchBtnSecondary}
-                  onPress={() => handleRetranscribeWithHint(mismatchTurn.id, bottomLanguage)}
-                >
-                  <Text style={styles.mismatchBtnSecondaryText}>Retranscribe using {getLanguageName(bottomLanguage)} hint</Text>
-                </Pressable>
-
-                <Pressable 
-                  style={[styles.mismatchBtnSecondary, { borderColor: colors.error }]}
-                  onPress={() => {
-                    setTurns(prev => prev.filter(t => t.id !== mismatchTurn.id));
-                    setMismatchTurn(null);
-                    setProcessingState('idle');
-                  }}
-                >
-                  <Text style={[styles.mismatchBtnSecondaryText, { color: colors.error }]}>Record again</Text>
-                </Pressable>
-              </ScrollView>
-            </View>
-          </View>
-        </Modal>
-      )}
-
-      {/* History Modal */}
+      {/* History Log Sheet Modal */}
       <Modal
         visible={showHistory}
         animationType="slide"
+        transparent={false}
         onRequestClose={() => setShowHistory(false)}
       >
         <SafeAreaView style={styles.historyContainer}>
           <View style={styles.historyHeader}>
-            <Text style={styles.historyTitle}>Session History</Text>
+            <Text style={styles.historyTitle}>Transcription History</Text>
             <Pressable onPress={() => setShowHistory(false)} style={styles.closeBtn}>
-              <Ionicons name="close" size={24} color={colors.textPrimary} />
+              <Ionicons name="close" size={24} color="#FFFFFF" />
             </Pressable>
           </View>
 
           {turns.length === 0 ? (
             <View style={styles.emptyHistory}>
-              <Ionicons name="time-outline" size={48} color={colors.textMuted} />
-              <Text style={styles.emptyHistoryTxt}>No speech logs in this session yet.</Text>
+              <Ionicons name="document-text-outline" size={64} color="rgba(255, 255, 255, 0.2)" />
+              <Text style={styles.emptyHistoryTxt}>No voice transcriptions logged yet.</Text>
             </View>
           ) : (
             <ScrollView contentContainerStyle={styles.historyList} showsVerticalScrollIndicator={false}>
-              {turns.map((turn, index) => {
-                const isBookmarked = bookmarkedIds[turn.id];
-                return (
-                  <View key={turn.id} style={styles.historyItemCard}>
-                    <View style={styles.historyItemMeta}>
-                      <Text style={styles.historyItemIndex}>#{index + 1}</Text>
-                      <Text style={styles.historyItemLang}>
-                        {getLanguageName(turn.sourceLanguage)} → {getLanguageName(turn.targetLanguage)}
-                      </Text>
-                      <Text style={styles.historyItemMode}>({turn.detectionMode})</Text>
+              {turns.map((turn, index) => (
+                <View key={turn.id || index} style={styles.historyCard}>
+                  <View style={styles.historyCardHeader}>
+                    <View style={styles.langPill}>
+                      <Text style={styles.langPillTxt}>{turn.detectedLanguageName}</Text>
                     </View>
-
-                    <Text style={styles.historyItemOriginal}>{turn.originalText}</Text>
-                    <Text style={styles.historyItemTranslated}>{turn.translatedText}</Text>
-
-                    {/* Quick audio play */}
-                    <View style={{ flexDirection: 'row', gap: 16, marginBottom: 12 }}>
-                      {turn.originalAudioUrl && (
-                        <Pressable 
-                          style={styles.replayRow}
-                          onPress={() => {
-                            player.replace({ uri: turn.originalAudioUrl });
-                            player.play();
-                          }}
-                        >
-                          <Ionicons name="play-circle-outline" size={14} color={colors.textSecondary} />
-                          <Text style={[styles.replayTxt, { color: colors.textSecondary }]}>Original audio</Text>
-                        </Pressable>
-                      )}
-
-                      {turn.translatedAudioUrl && (
-                        <Pressable 
-                          style={styles.replayRow}
-                          onPress={() => {
-                            player.replace({ uri: turn.translatedAudioUrl });
-                            player.play();
-                          }}
-                        >
-                          <Ionicons name="play" size={14} color={colors.primary} />
-                          <Text style={styles.replayTxt}>Translated audio</Text>
-                        </Pressable>
-                      )}
-                    </View>
-
-                    <View style={styles.historyActionsRow}>
-                      {/* Manual correction triggers */}
-                      <Pressable 
-                        style={styles.actionPill}
-                        onPress={() => handleManualDirectionResolve(turn.id, topLanguage, bottomLanguage, 'first')}
-                      >
-                        <Text style={styles.actionPillText}>Force {getLanguageName(topLanguage)}</Text>
-                      </Pressable>
-
-                      <Pressable 
-                        style={styles.actionPill}
-                        onPress={() => handleManualDirectionResolve(turn.id, bottomLanguage, topLanguage, 'second')}
-                      >
-                        <Text style={styles.actionPillText}>Force {getLanguageName(bottomLanguage)}</Text>
-                      </Pressable>
-
-                      <View style={{ flex: 1 }} />
-
-                      <Pressable style={styles.actionCircle} onPress={() => handleToggleBookmark(turn)}>
-                        <Ionicons 
-                          name={isBookmarked ? "bookmark" : "bookmark-outline"} 
-                          size={16} 
-                          color={isBookmarked ? colors.accentOrange : colors.textSecondary} 
-                        />
-                      </Pressable>
-
-                      <Pressable style={styles.actionCircle} onPress={() => handleShareTurn(turn)}>
-                        <Ionicons name="share-outline" size={16} color={colors.textSecondary} />
-                      </Pressable>
-
-                      <Pressable style={styles.actionCircle} onPress={() => handleCopyTurn(turn)}>
-                        <Ionicons name="copy-outline" size={16} color={colors.textSecondary} />
-                      </Pressable>
-                    </View>
+                    <Text style={styles.historyTime}>
+                      {new Date(turn.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                    </Text>
                   </View>
-                );
-              })}
+
+                  <Text style={styles.historyText}>{turn.text}</Text>
+
+                  <View style={styles.historyActions}>
+                    {turn.originalAudioUrl && (
+                      <Pressable 
+                        style={styles.actionBtn}
+                        onPress={() => {
+                          player.replace({ uri: turn.originalAudioUrl });
+                          player.play();
+                        }}
+                      >
+                        <Ionicons name="play-outline" size={14} color="#FFFFFF" style={{ marginRight: 4 }} />
+                        <Text style={styles.actionTxt}>Voice</Text>
+                      </Pressable>
+                    )}
+
+                    {turn.translatedAudioUrl && (
+                      <Pressable 
+                        style={styles.actionBtn}
+                        onPress={() => {
+                          player.replace({ uri: turn.translatedAudioUrl });
+                          player.play();
+                        }}
+                      >
+                        <Ionicons name="volume-medium-outline" size={14} color={colors.accentBlue} style={{ marginRight: 4 }} />
+                        <Text style={[styles.actionTxt, { color: colors.accentBlue }]}>Synthesis</Text>
+                      </Pressable>
+                    )}
+
+                    <View style={{ flex: 1 }} />
+
+                    <Pressable 
+                      style={styles.actionCircle}
+                      onPress={async () => {
+                        Clipboard.setString(turn.text);
+                        Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+                        Alert.alert('Copied', 'Text copied to clipboard.');
+                      }}
+                    >
+                      <Ionicons name="copy-outline" size={16} color="rgba(255, 255, 255, 0.6)" />
+                    </Pressable>
+
+                    <Pressable 
+                      style={styles.actionCircle}
+                      onPress={async () => {
+                        try {
+                          await Share.share({ message: turn.text });
+                        } catch (e) {
+                          console.error(e);
+                        }
+                      }}
+                    >
+                      <Ionicons name="share-social-outline" size={16} color="rgba(255, 255, 255, 0.6)" />
+                    </Pressable>
+                  </View>
+                </View>
+              ))}
             </ScrollView>
           )}
         </SafeAreaView>
@@ -1324,7 +638,7 @@ export default function ConverseTab() {
 const styles = StyleSheet.create({
   container: {
     flex: 1,
-    backgroundColor: colors.background,
+    backgroundColor: '#121214',
   },
   header: {
     flexDirection: 'row',
@@ -1333,569 +647,291 @@ const styles = StyleSheet.create({
     paddingHorizontal: spacing.md,
     paddingVertical: spacing.sm,
     borderBottomWidth: 1,
-    borderBottomColor: colors.border,
-    backgroundColor: colors.background,
+    borderBottomColor: '#202024',
+    backgroundColor: '#121214',
   },
   headerBtn: {
-    padding: 6,
+    padding: 8,
   },
-  headerLangContainer: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    backgroundColor: colors.surfaceSoft,
-    borderRadius: 20,
-    paddingHorizontal: 8,
-    paddingVertical: 4,
-    borderWidth: 1,
-    borderColor: colors.border,
-  },
-  headerLangSelector: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    paddingHorizontal: 12,
-    paddingVertical: 6,
-    borderRadius: 14,
-  },
-  meSelector: {
-    backgroundColor: 'rgba(92, 107, 192, 0.1)',
-  },
-  headerLangText: {
-    ...typography.captionMedium,
-    color: colors.textPrimary,
-    fontWeight: '700',
-  },
-  meBadge: {
-    backgroundColor: colors.primary,
-    borderRadius: 6,
-    paddingHorizontal: 4,
-    paddingVertical: 1,
-    marginLeft: 4,
-  },
-  meBadgeText: {
-    fontSize: 8,
+  headerTitle: {
+    ...typography.bodyMedium,
     color: '#FFFFFF',
-    fontWeight: '700',
+    fontWeight: '800',
+    letterSpacing: 1.5,
+    textTransform: 'uppercase',
   },
-  headerSwapBtn: {
-    padding: 4,
-    marginHorizontal: 4,
-  },
-  mainContent: {
-    flex: 1,
-    flexDirection: 'column',
-  },
-  topPanel: {
-    flex: 1,
-    backgroundColor: '#1C1C1E',
-    paddingHorizontal: 20,
-    paddingTop: 16,
-    paddingBottom: 8,
-  },
-  bottomPanel: {
-    flex: 1,
-    backgroundColor: '#FFFFFF',
-    paddingHorizontal: 20,
-    paddingTop: 16,
-    paddingBottom: 8,
-  },
-  activePanelGlowDark: {
-    backgroundColor: '#1E1E24',
-  },
-  activePanelGlowLight: {
-    backgroundColor: '#FAF9FB',
-  },
-  emptyPanelContent: {
-    flex: 1,
-    alignItems: 'center',
-    justifyContent: 'center',
-    opacity: 0.8,
-  },
-  emptyPanelTextDark: {
-    ...typography.bodyMedium,
-    color: 'rgba(255, 255, 255, 0.45)',
-    textAlign: 'center',
-    marginTop: 8,
-  },
-  emptyPanelTextLight: {
-    ...typography.bodyMedium,
-    color: 'rgba(0, 0, 0, 0.4)',
-    textAlign: 'center',
-    marginTop: 8,
-  },
-  panelScrollContent: {
+  scrollContainer: {
     flexGrow: 1,
-    justifyContent: 'center',
+    paddingHorizontal: spacing.md,
+    paddingTop: spacing.md,
+    paddingBottom: spacing.xl,
   },
-  panelCard: {
-    width: '100%',
-    padding: 8,
-  },
-  panelCardHeader: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    alignItems: 'center',
-    marginBottom: 8,
-  },
-  panelCardLangDark: {
-    fontSize: 10,
-    fontWeight: '800',
-    color: colors.accentBlue,
-    letterSpacing: 1,
-  },
-  panelCardLangLight: {
-    fontSize: 10,
-    fontWeight: '800',
-    color: colors.primary,
-    letterSpacing: 1,
-  },
-  panelCardDetectedDark: {
-    fontSize: 9,
-    color: 'rgba(255, 255, 255, 0.4)',
-  },
-  panelCardDetectedLight: {
-    fontSize: 9,
-    color: 'rgba(0, 0, 0, 0.4)',
-  },
-  panelCardTextDark: {
-    fontSize: 22,
-    fontWeight: '500',
-    color: '#FFFFFF',
-    lineHeight: 28,
-  },
-  panelCardTextDarkTranslated: {
-    fontSize: 24,
-    fontWeight: '700',
-    color: '#FFFFFF',
-    lineHeight: 30,
-  },
-  panelCardTextLight: {
-    fontSize: 22,
-    fontWeight: '500',
-    color: '#1C1C1E',
-    lineHeight: 28,
-  },
-  panelCardTextLightTranslated: {
-    fontSize: 24,
-    fontWeight: '700',
-    color: colors.primary,
-    lineHeight: 30,
-  },
-  speakerIconDark: {
-    backgroundColor: 'rgba(255, 255, 255, 0.1)',
-    borderRadius: 16,
-    width: 32,
-    height: 32,
-    justifyContent: 'center',
-    alignItems: 'center',
-  },
-  speakerIconLight: {
-    backgroundColor: 'rgba(0, 0, 0, 0.05)',
-    borderRadius: 16,
-    width: 32,
-    height: 32,
-    justifyContent: 'center',
-    alignItems: 'center',
-  },
-  errorCard: {
-    alignItems: 'center',
-    justifyContent: 'center',
-    padding: 12,
-  },
-  errorCardTextDark: {
-    color: 'rgba(255, 255, 255, 0.7)',
-    marginBottom: 8,
-  },
-  errorCardTextLight: {
-    color: '#1C1C1E',
-    marginBottom: 8,
-  },
-  retryBtnDark: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    backgroundColor: colors.primary,
-    paddingHorizontal: 12,
-    paddingVertical: 6,
-    borderRadius: 8,
-  },
-  retryBtnTextDark: {
-    fontSize: 12,
-    color: '#FFFFFF',
-    fontWeight: '700',
-  },
-  retryBtnLight: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    backgroundColor: colors.surfaceSoft,
-    paddingHorizontal: 12,
-    paddingVertical: 6,
-    borderRadius: 8,
-    borderWidth: 1,
-    borderColor: colors.border,
-  },
-  retryBtnTextLight: {
-    fontSize: 12,
-    color: colors.textPrimary,
-    fontWeight: '700',
-  },
-  errorRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    marginTop: 8,
-  },
-  errorSubTextDark: {
-    fontSize: 10,
-    color: colors.error,
-    marginRight: 6,
-  },
-  errorSubTextLight: {
-    fontSize: 10,
-    color: colors.error,
-    marginRight: 6,
-  },
-  retryTextBtn: {
-    padding: 2,
-  },
-  retryTextBtnTxt: {
-    fontSize: 10,
-    fontWeight: '700',
-    color: colors.primary,
-    textDecorationLine: 'underline',
-  },
-  centerControlBar: {
-    height: 90,
-    backgroundColor: colors.surfaceSoft,
-    borderTopWidth: 1,
-    borderBottomWidth: 1,
-    borderColor: colors.border,
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'space-between',
-    paddingHorizontal: 16,
-    zIndex: 10,
-  },
-  leftControlCol: {
-    flexDirection: 'column',
-    gap: 6,
-    width: 85,
-  },
-  rightControlCol: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 8,
-    width: 95,
-    justifyContent: 'flex-end',
-  },
-  centerMicCol: {
-    alignItems: 'center',
-    justifyContent: 'center',
+  dictationBoard: {
     flex: 1,
-  },
-  settingToggle: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'space-between',
-    width: '100%',
-  },
-  settingText: {
-    fontSize: 10,
-    fontWeight: '700',
-    color: colors.textSecondary,
-  },
-  actionBtnIcon: {
-    padding: 8,
-    borderRadius: 8,
-    backgroundColor: '#FBE9E7',
-  },
-  actionBtnText: {
-    backgroundColor: colors.primary,
-    paddingHorizontal: 12,
-    paddingVertical: 8,
-    borderRadius: 8,
-  },
-  actionBtnTextTxt: {
-    fontSize: 12,
-    fontWeight: '700',
-    color: '#FFFFFF',
-  },
-  centerMicContainer: {
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  centerMicButton: {
-    width: 60,
-    height: 60,
-    borderRadius: 30,
-    backgroundColor: colors.primary,
-    justifyContent: 'center',
-    alignItems: 'center',
-    shadowColor: '#000',
-    shadowOffset: { width: 0, height: 3 },
-    shadowOpacity: 0.2,
-    shadowRadius: 4,
-    elevation: 6,
-    borderWidth: 2,
-    borderColor: '#FFFFFF',
-  },
-  centerMicButtonRecording: {
-    backgroundColor: colors.error,
-  },
-  waveRow: {
-    position: 'absolute',
-    top: -30,
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 3,
-    height: 24,
-  },
-  waveBar: {
-    width: 2.5,
-    borderRadius: 1.25,
-  },
-  timerTextContainer: {
-    position: 'absolute',
-    top: -24,
-  },
-  timerText: {
-    fontSize: 10,
-    fontWeight: '700',
-    color: colors.textPrimary,
-    backgroundColor: colors.surface,
+    minHeight: 350,
+    backgroundColor: '#1C1C1E',
+    borderRadius: 24,
     borderWidth: 1,
-    borderColor: colors.border,
-    borderRadius: 8,
-    paddingHorizontal: 6,
-    paddingVertical: 2,
-    overflow: 'hidden',
+    borderColor: '#2C2C2E',
+    padding: spacing.md,
+    marginBottom: spacing.md,
   },
-  modalOverlay: {
-    flex: 1,
-    backgroundColor: colors.overlay,
-    justifyContent: 'flex-end',
-  },
-  modalContainer: {
-    backgroundColor: colors.background,
-    borderTopLeftRadius: layout.cardRadius,
-    borderTopRightRadius: layout.cardRadius,
-    height: '60%',
-    padding: spacing.lg,
-  },
-  modalHeader: {
+  detectedBadgeRow: {
     flexDirection: 'row',
-    justifyContent: 'space-between',
     alignItems: 'center',
     borderBottomWidth: 1,
-    borderColor: colors.border,
+    borderBottomColor: '#2C2C2E',
     paddingBottom: spacing.sm,
     marginBottom: spacing.sm,
   },
-  modalTitle: {
-    ...typography.heading3,
-    color: colors.textPrimary,
-  },
-  modalCloseBtn: {
-    padding: 4,
-  },
-  languagesList: {
-    flex: 1,
-  },
-  languageItem: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    alignItems: 'center',
-    paddingVertical: spacing.md,
-    borderBottomWidth: 0.5,
-    borderColor: colors.border,
-  },
-  languageItemText: {
-    ...typography.bodyMedium,
-    color: colors.textPrimary,
-  },
-  languageItemNative: {
-    ...typography.caption,
-    color: colors.textMuted,
-  },
-  mismatchOverlay: {
-    flex: 1,
-    backgroundColor: colors.overlay,
-    justifyContent: 'center',
-    alignItems: 'center',
-  },
-  mismatchCard: {
-    width: '85%',
-    backgroundColor: '#FFFFFF',
-    borderRadius: 20,
-    padding: 24,
-    alignItems: 'center',
-    shadowColor: '#000',
-    shadowOffset: { width: 0, height: 10 },
-    shadowOpacity: 0.25,
-    shadowRadius: 15,
-    elevation: 10,
-  },
-  mismatchTitle: {
-    fontSize: 18,
-    fontWeight: '800',
-    color: colors.textPrimary,
-    marginBottom: 8,
-  },
-  mismatchSubtitle: {
-    fontSize: 13,
-    color: colors.textSecondary,
-    textAlign: 'center',
-    lineHeight: 18,
-    marginBottom: 20,
-  },
-  mismatchActions: {
-    gap: 8,
-    width: '100%',
-  },
-  mismatchBtnPrimary: {
-    backgroundColor: colors.primary,
-    borderRadius: 12,
-    paddingVertical: 12,
-    alignItems: 'center',
-    width: '100%',
-    marginBottom: 6,
-  },
-  mismatchBtnPrimaryText: {
-    color: '#FFFFFF',
-    fontWeight: '700',
-    fontSize: 14,
-  },
-  mismatchBtnSecondary: {
-    borderWidth: 1,
-    borderColor: colors.borderStrong,
-    borderRadius: 12,
-    paddingVertical: 12,
-    alignItems: 'center',
-    width: '100%',
-  },
-  mismatchBtnSecondaryText: {
-    color: colors.textPrimary,
+  detectedBadgeText: {
+    fontSize: 12,
     fontWeight: '600',
-    fontSize: 13,
+    color: '#FFFFFF',
+  },
+  detectedBadgePlaceholder: {
+    fontSize: 12,
+    fontWeight: '500',
+    color: 'rgba(255, 255, 255, 0.4)',
+  },
+  textContainer: {
+    flex: 1,
+    marginVertical: spacing.xs,
+  },
+  textScrollContent: {
+    flexGrow: 1,
+  },
+  dictatedText: {
+    fontSize: 20,
+    lineHeight: 28,
+    color: '#FFFFFF',
+    fontWeight: '500',
+  },
+  placeholderText: {
+    fontSize: 16,
+    lineHeight: 24,
+    color: 'rgba(255, 255, 255, 0.35)',
+    fontStyle: 'italic',
+  },
+  loadingContainer: {
+    flex: 1,
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingVertical: spacing.xl,
+  },
+  loadingText: {
+    fontSize: 14,
+    color: 'rgba(255, 255, 255, 0.6)',
+    marginTop: spacing.md,
+  },
+  boardActionsRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    borderTopWidth: 1,
+    borderTopColor: '#2C2C2E',
+    paddingTop: spacing.md,
+    marginTop: spacing.sm,
+    gap: spacing.sm,
+  },
+  boardActionBtn: {
+    flex: 1,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: 'rgba(255, 255, 255, 0.05)',
+    borderRadius: 12,
+    paddingVertical: 10,
+    borderWidth: 1,
+    borderColor: 'rgba(255, 255, 255, 0.08)',
+  },
+  boardActionTxt: {
+    fontSize: 12,
+    fontWeight: '600',
+    color: '#FFFFFF',
+    marginLeft: 6,
+  },
+  micControlCard: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    backgroundColor: '#1C1C1E',
+    borderRadius: 24,
+    borderWidth: 1,
+    borderColor: '#2C2C2E',
+    padding: spacing.md,
+    paddingVertical: 18,
+  },
+  micSettings: {
+    flex: 1.2,
+    justifyContent: 'center',
+    gap: 12,
+  },
+  toggleRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+  },
+  toggleLabel: {
+    fontSize: 11,
+    fontWeight: '600',
+    color: 'rgba(255, 255, 255, 0.65)',
+  },
+  micOrbContainer: {
+    flex: 1.5,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  timerWrapper: {
+    position: 'absolute',
+    top: -24,
+    backgroundColor: 'rgba(239, 83, 80, 0.15)',
+    paddingHorizontal: 8,
+    paddingVertical: 2,
+    borderRadius: 8,
+  },
+  timerText: {
+    fontSize: 11,
+    fontWeight: '700',
+    color: '#EF5350',
+    letterSpacing: 0.5,
+  },
+  micOrb: {
+    width: 64,
+    height: 64,
+    borderRadius: 32,
+    backgroundColor: '#EF5350',
+    alignItems: 'center',
+    justifyContent: 'center',
+    shadowColor: '#EF5350',
+    shadowOffset: { width: 0, height: 0 },
+    shadowOpacity: 0.45,
+    shadowRadius: 10,
+    elevation: 6,
+    marginBottom: spacing.xs,
+  },
+  micOrbRecording: {
+    backgroundColor: '#E53935',
+    transform: [{ scale: 1.1 }],
+    shadowRadius: 16,
+  },
+  micOrbProcessing: {
+    backgroundColor: colors.accentBlue,
+    shadowColor: colors.accentBlue,
+  },
+  micStatusLabel: {
+    fontSize: 9,
+    fontWeight: '800',
+    color: 'rgba(255, 255, 255, 0.4)',
+    letterSpacing: 1,
+    marginTop: 2,
+  },
+  infoCol: {
+    flex: 0.8,
+    alignItems: 'flex-end',
+    justifyContent: 'center',
   },
   historyContainer: {
     flex: 1,
-    backgroundColor: colors.background,
+    backgroundColor: '#121214',
   },
   historyHeader: {
     flexDirection: 'row',
-    justifyContent: 'space-between',
     alignItems: 'center',
-    padding: 20,
+    justifyContent: 'space-between',
+    paddingHorizontal: spacing.md,
+    paddingVertical: spacing.md,
     borderBottomWidth: 1,
-    borderColor: colors.border,
+    borderBottomColor: '#202024',
   },
   historyTitle: {
     fontSize: 18,
     fontWeight: '800',
-    color: colors.textPrimary,
+    color: '#FFFFFF',
   },
   closeBtn: {
-    padding: 4,
+    padding: 6,
   },
   emptyHistory: {
     flex: 1,
-    justifyContent: 'center',
     alignItems: 'center',
-    opacity: 0.6,
+    justifyContent: 'center',
+    paddingHorizontal: spacing.xl,
   },
   emptyHistoryTxt: {
-    fontSize: 14,
-    color: colors.textMuted,
-    marginTop: 10,
+    fontSize: 15,
+    color: 'rgba(255, 255, 255, 0.4)',
+    textAlign: 'center',
+    marginTop: spacing.md,
   },
   historyList: {
-    padding: 20,
-    gap: 16,
+    padding: spacing.md,
+    gap: spacing.md,
   },
-  historyItemCard: {
-    backgroundColor: '#FFFFFF',
+  historyCard: {
+    backgroundColor: '#1C1C1E',
     borderRadius: 16,
-    padding: 16,
     borderWidth: 1,
-    borderColor: colors.border,
-    shadowColor: '#000',
-    shadowOffset: { width: 0, height: 2 },
-    shadowOpacity: 0.05,
-    shadowRadius: 4,
-    elevation: 2,
+    borderColor: '#2C2C2E',
+    padding: spacing.md,
   },
-  historyItemMeta: {
+  historyCardHeader: {
     flexDirection: 'row',
     alignItems: 'center',
-    marginBottom: 8,
-    gap: 6,
+    justifyContent: 'space-between',
+    marginBottom: spacing.sm,
   },
-  historyItemIndex: {
-    fontSize: 10,
-    fontWeight: '800',
-    color: colors.textMuted,
-    backgroundColor: colors.surfaceSoft,
-    paddingHorizontal: 6,
-    paddingVertical: 2,
-    borderRadius: 4,
-  },
-  historyItemLang: {
-    fontSize: 10,
-    fontWeight: '700',
-    color: colors.primary,
-  },
-  historyItemMode: {
-    fontSize: 9,
-    color: colors.textMuted,
-  },
-  historyItemOriginal: {
-    fontSize: 15,
-    fontWeight: '600',
-    color: colors.textPrimary,
-    marginBottom: 4,
-  },
-  historyItemTranslated: {
-    fontSize: 16,
-    fontWeight: '700',
-    color: colors.primary,
-    marginBottom: 10,
-  },
-  replayRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 4,
-    marginBottom: 12,
-  },
-  replayTxt: {
-    fontSize: 11,
-    color: colors.primary,
-    fontWeight: '700',
-  },
-  historyActionsRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 8,
-    borderTopWidth: 0.5,
-    borderColor: colors.border,
-    paddingTop: 10,
-  },
-  actionPill: {
-    backgroundColor: colors.surfaceSoft,
-    borderRadius: 10,
+  langPill: {
+    backgroundColor: 'rgba(92, 107, 192, 0.2)',
     paddingHorizontal: 8,
-    paddingVertical: 4,
-    borderWidth: 0.5,
-    borderColor: colors.borderStrong,
+    paddingVertical: 2,
+    borderRadius: 8,
   },
-  actionPillText: {
-    fontSize: 9,
-    color: colors.textSecondary,
+  langPillTxt: {
+    fontSize: 10,
     fontWeight: '700',
+    color: '#8F9BFF',
+    textTransform: 'uppercase',
+  },
+  historyTime: {
+    fontSize: 11,
+    color: 'rgba(255, 255, 255, 0.45)',
+  },
+  historyText: {
+    fontSize: 16,
+    lineHeight: 24,
+    color: '#FFFFFF',
+    fontWeight: '400',
+    marginBottom: spacing.md,
+  },
+  historyActions: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: spacing.sm,
+  },
+  actionBtn: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: 'rgba(255, 255, 255, 0.05)',
+    borderRadius: 8,
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    borderWidth: 1,
+    borderColor: 'rgba(255, 255, 255, 0.08)',
+  },
+  actionTxt: {
+    fontSize: 11,
+    fontWeight: '600',
+    color: '#FFFFFF',
   },
   actionCircle: {
-    width: 28,
-    height: 28,
-    borderRadius: 14,
-    backgroundColor: colors.surfaceSoft,
-    justifyContent: 'center',
+    width: 32,
+    height: 32,
+    borderRadius: 16,
+    backgroundColor: 'rgba(255, 255, 255, 0.05)',
     alignItems: 'center',
+    justifyContent: 'center',
+    borderWidth: 1,
+    borderColor: 'rgba(255, 255, 255, 0.08)',
   },
 });
