@@ -203,7 +203,14 @@ export const elevenLabsService = {
   /**
    * Transcribe an audio file using the transcribe-audio Edge Function
    */
-  async transcribeAudio(audioUri: string): Promise<TranscriptionResponse> {
+  async transcribeAudio(audioUri: string, language?: string): Promise<{
+    success: boolean;
+    text: string;
+    detectedLanguage: string | null;
+    detectedLanguageName: string | null;
+    languageConfidence: number | null;
+    durationSeconds: number | null;
+  }> {
     const formData = new FormData();
     if (Platform.OS === 'web') {
       const response = await fetch(audioUri);
@@ -216,8 +223,11 @@ export const elevenLabsService = {
         type: 'audio/wav',
       } as any);
     }
+    if (language) {
+      formData.append('language', language);
+    }
 
-    const { data, error } = await callEdgeFunction<TranscriptionResponse>('transcribe-audio', formData);
+    const { data, error } = await callEdgeFunction<any>('transcribe-audio', formData);
     if (error || !data) {
       throw error || new Error('Failed to transcribe audio');
     }
