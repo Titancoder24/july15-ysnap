@@ -14,6 +14,21 @@ export interface ResolveDirectionResult {
   inferredFromPrevious?: boolean;
 }
 
+function detectScriptLanguage(text: string): string | null {
+  if (/[\u0B80-\u0BFF]/.test(text)) return 'ta'; // Tamil
+  if (/[\u0900-\u097F]/.test(text)) return 'hi'; // Hindi
+  if (/[\u0C00-\u0C7F]/.test(text)) return 'te'; // Telugu
+  if (/[\u0600-\u06FF]/.test(text)) return 'ar'; // Arabic
+  if (/[\u3040-\u309F\u30A0-\u30FF\u4E00-\u9FAF]/.test(text)) return 'ja'; // Japanese
+  if (/[\uAC00-\uD7AF]/.test(text)) return 'ko'; // Korean
+  return null;
+}
+
+function containsEnglishStopwords(text: string): boolean {
+  const stopwords = /\b(the|and|this|that|with|you|your|what|how|where|please|hello|yes|no|good|morning|evening|welcome|speak|translate|conversation)\b/i;
+  return stopwords.test(text);
+}
+
 /**
  * pure utility to resolve conversation direction based on speech detection.
  */
@@ -24,12 +39,26 @@ export function resolveConversationDirection({
   previousDetectedLanguage,
   transcript
 }: ResolveDirectionParams): ResolveDirectionResult {
-  const normDetected = detectedLanguage?.toLowerCase().trim() || null;
   const normFirst = firstLanguage.toLowerCase().trim();
   const normSecond = secondLanguage.toLowerCase().trim();
 
+  // Try to infer language directly from character sets or stop words first
+  let resolvedLang = detectedLanguage?.toLowerCase().trim() || null;
+
+  const scriptLang = detectScriptLanguage(transcript);
+  if (scriptLang && (scriptLang === normFirst || scriptLang === normSecond)) {
+    resolvedLang = scriptLang;
+  }
+
+  // Fallback: If no language is detected but transcript has English stop words
+  if (!resolvedLang && containsEnglishStopwords(transcript)) {
+    if (normFirst === 'en' || normSecond === 'en') {
+      resolvedLang = 'en';
+    }
+  }
+
   // Rule 1: Matches first language
-  if (normDetected === normFirst) {
+  if (resolvedLang === normFirst) {
     return {
       sourceLanguage: firstLanguage,
       targetLanguage: secondLanguage,
@@ -39,7 +68,7 @@ export function resolveConversationDirection({
   }
 
   // Rule 2: Matches second language
-  if (normDetected === normSecond) {
+  if (resolvedLang === normSecond) {
     return {
       sourceLanguage: secondLanguage,
       targetLanguage: firstLanguage,
@@ -49,9 +78,9 @@ export function resolveConversationDirection({
   }
 
   // Rule 3: Detected language is outside the selected pair
-  if (normDetected !== null) {
+  if (resolvedLang !== null) {
     return {
-      sourceLanguage: '',
+      sourceLanguage: resolvedLang, // Populate mismatched language code
       targetLanguage: '',
       sourcePanel: 'unknown',
       status: 'language-mismatch'

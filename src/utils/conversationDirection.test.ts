@@ -1,4 +1,4 @@
-import { resolveConversationDirection } from './conversationDirection';
+import { resolveConversationDirection } from './conversationDirection.ts';
 
 function runTests() {
   console.log("=========================================");
@@ -96,10 +96,38 @@ function runTests() {
     firstLanguage: 'ta',
     secondLanguage: 'en',
     previousDetectedLanguage: 'ta',
-    transcript: 'This is a long sentence that should not be automatically resolved.'
+    transcript: 'bla bla bla bla bla bla bla bla bla bla bla bla bla bla bla bla'
   });
   assert('Long speech with missing language does not reuse previous', 
     t6.status === 'manual-required'
+  );
+
+  // Test 7: Unicode Tamil script detection override when detectedLanguage is null
+  const t7 = resolveConversationDirection({
+    detectedLanguage: null,
+    firstLanguage: 'ta',
+    secondLanguage: 'en',
+    previousDetectedLanguage: null,
+    transcript: 'நல்லது, நன்றி!'
+  });
+  assert('Script detection resolves Tamil characters to first panel', 
+    t7.status === 'resolved' && 
+    t7.sourceLanguage === 'ta' && 
+    t7.sourcePanel === 'first'
+  );
+
+  // Test 8: English stop word detection override when detectedLanguage is null
+  const t8 = resolveConversationDirection({
+    detectedLanguage: null,
+    firstLanguage: 'ta',
+    secondLanguage: 'en',
+    previousDetectedLanguage: null,
+    transcript: 'please translate this sentence'
+  });
+  assert('Stop-word detection resolves English words to second panel', 
+    t8.status === 'resolved' && 
+    t8.sourceLanguage === 'en' && 
+    t8.sourcePanel === 'second'
   );
 
   console.log("=========================================");
