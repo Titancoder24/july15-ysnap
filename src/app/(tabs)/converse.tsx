@@ -239,6 +239,40 @@ export default function ConverseTab() {
     return session.id;
   };
 
+  const uploadAudioToStorage = async (localUri: string): Promise<string | null> => {
+    if (!user) return null;
+    try {
+      const fileExt = localUri.split('.').pop() || 'wav';
+      const fileName = `${Date.now()}.${fileExt}`;
+      const path = `${user.id}/${fileName}`;
+      
+      const response = await fetch(localUri);
+      const blob = await response.blob();
+
+      const { data, error } = await supabase.storage
+        .from('media')
+        .upload(path, blob, {
+          contentType: `audio/${fileExt}`,
+          cacheControl: '3600',
+          upsert: false
+        });
+
+      if (error) {
+        console.error("Storage upload error:", error);
+        return null;
+      }
+
+      const { data: urlData } = supabase.storage
+        .from('media')
+        .getPublicUrl(path);
+
+      return urlData?.publicUrl || null;
+    } catch (e) {
+      console.error("Error uploading audio to storage:", e);
+      return null;
+    }
+  };
+
   const saveTurnToDb = async (turn: ConversationTurn) => {
     if (!user) return;
     try {
@@ -253,16 +287,17 @@ export default function ConverseTab() {
           sequence_number: turns.length + 1,
           source_text: turn.originalText,
           translated_text: turn.translatedText || null,
-          detected_language: turn.detected_language || null,
-          detected_language_name: turn.detected_language_name || null,
+          detected_language: turn.detectedLanguage || null,
+          detected_language_name: turn.detectedLanguageName || null,
           source_language: turn.sourceLanguage,
           target_language: turn.targetLanguage,
           source_panel: turn.sourcePanel,
           detection_mode: turn.detectionMode,
           status: turn.status,
-          transcription_error: turn.transcription_error || null,
-          translation_error: turn.translation_error || null,
+          transcription_error: turn.transcriptionError || null,
+          translation_error: turn.translationError || null,
           speech_error: turn.speechError || null,
+          source_audio_path: turn.originalAudioUrl || null,
           generated_audio_path: turn.translatedAudioUrl || null,
           created_at: turn.createdAt,
         } as any);
@@ -361,6 +396,14 @@ export default function ConverseTab() {
     setTurns(prev => [...prev, newTurn]);
 
     try {
+      // 0. Upload recorded source audio to storage concurrently
+      let sourceAudioUrl: string | null = null;
+      try {
+        sourceAudioUrl = await uploadAudioToStorage(audioUri);
+      } catch (uploadErr) {
+        console.error("Failed to upload source audio to storage:", uploadErr);
+      }
+
       // 1. Transcribe
       const result = await elevenLabsService.transcribeAudio(audioUri, languageHint);
       if (!result.text || !result.text.trim()) {
@@ -372,6 +415,7 @@ export default function ConverseTab() {
         originalText: result.text,
         detectedLanguage: result.detectedLanguage || '',
         detectedLanguageName: result.detectedLanguageName || '',
+        originalAudioUrl: sourceAudioUrl || undefined
       } : t));
 
       // 2. Resolve Direction
@@ -392,6 +436,7 @@ export default function ConverseTab() {
         targetLanguage: resolution.targetLanguage,
         sourcePanel: resolution.sourcePanel,
         detectionMode: resolution.inferredFromPrevious ? 'previous-turn-fallback' : 'provider',
+        originalAudioUrl: sourceAudioUrl || undefined
       };
 
       setTurns(prev => prev.map(t => t.id === turnId ? updatedTurn : t));
@@ -1203,18 +1248,33 @@ export default function ConverseTab() {
                     <Text style={styles.historyItemTranslated}>{turn.translatedText}</Text>
 
                     {/* Quick audio play */}
-                    {turn.translatedAudioUrl && (
-                      <Pressable 
-                        style={styles.replayRow}
-                        onPress={() => {
-                          player.replace({ uri: turn.translatedAudioUrl });
-                          player.play();
-                        }}
-                      >
-                        <Ionicons name="play" size={12} color={colors.primary} />
-                        <Text style={styles.replayTxt}>Play translated audio</Text>
-                      </Pressable>
-                    )}
+                    <View style={{ flexDirection: 'row', gap: 16, marginBottom: 12 }}>
+                      {turn.originalAudioUrl && (
+                        <Pressable 
+                          style={styles.replayRow}
+                          onPress={() => {
+                            player.replace({ uri: turn.originalAudioUrl });
+                            player.play();
+                          }}
+                        >
+                          <Ionicons name="play-circle-outline" size={14} color={colors.textSecondary} />
+                          <Text style={[styles.replayTxt, { color: colors.textSecondary }]}>Original audio</Text>
+                        </Pressable>
+                      )}
+
+                      {turn.translatedAudioUrl && (
+                        <Pressable 
+                          style={styles.replayRow}
+                          onPress={() => {
+                            player.replace({ uri: turn.translatedAudioUrl });
+                            player.play();
+                          }}
+                        >
+                          <Ionicons name="play" size={14} color={colors.primary} />
+                          <Text style={styles.replayTxt}>Translated audio</Text>
+                        </Pressable>
+                      )}
+                    </View>
 
                     <View style={styles.historyActionsRow}>
                       {/* Manual correction triggers */}
