@@ -8,22 +8,97 @@ import {
   getSecret
 } from "../shared/index.ts";
 
+const whisperLanguages = [
+  { code: 'en', name: 'English' },
+  { code: 'es', name: 'Spanish' },
+  { code: 'fr', name: 'French' },
+  { code: 'de', name: 'German' },
+  { code: 'it', name: 'Italian' },
+  { code: 'pt', name: 'Portuguese' },
+  { code: 'ru', name: 'Russian' },
+  { code: 'zh', name: 'Chinese' },
+  { code: 'ja', name: 'Japanese' },
+  { code: 'ko', name: 'Korean' },
+  { code: 'ar', name: 'Arabic' },
+  { code: 'hi', name: 'Hindi' },
+  { code: 'ta', name: 'Tamil' },
+  { code: 'te', name: 'Telugu' },
+  { code: 'bn', name: 'Bengali' },
+  { code: 'th', name: 'Thai' },
+  { code: 'vi', name: 'Vietnamese' },
+  { code: 'id', name: 'Indonesian' },
+  { code: 'ms', name: 'Malay' },
+  { code: 'tr', name: 'Turkish' },
+  { code: 'pl', name: 'Polish' },
+  { code: 'nl', name: 'Dutch' },
+  { code: 'sv', name: 'Swedish' },
+  { code: 'da', name: 'Danish' },
+  { code: 'no', name: 'Norwegian' },
+  { code: 'fi', name: 'Finnish' },
+  { code: 'uk', name: 'Ukrainian' },
+  { code: 'el', name: 'Greek' },
+  { code: 'he', name: 'Hebrew' },
+  { code: 'cs', name: 'Czech' },
+  { code: 'ro', name: 'Romanian' },
+  { code: 'hu', name: 'Hungarian' },
+  { code: 'sw', name: 'Swahili' },
+  { code: 'fa', name: 'Persian' },
+  { code: 'ur', name: 'Urdu' },
+  { code: 'ml', name: 'Malayalam' },
+  { code: 'kn', name: 'Kannada' },
+  { code: 'mr', name: 'Marathi' },
+  { code: 'gu', name: 'Gujarati' },
+  { code: 'pa', name: 'Punjabi' },
+  { code: 'af', name: 'Afrikaans' },
+  { code: 'hy', name: 'Armenian' },
+  { code: 'as', name: 'Assamese' },
+  { code: 'az', name: 'Azerbaijani' },
+  { code: 'be', name: 'Belarusian' },
+  { code: 'bs', name: 'Bosnian' },
+  { code: 'bg', name: 'Bulgarian' },
+  { code: 'ca', name: 'Catalan' },
+  { code: 'ceb', name: 'Cebuano' },
+  { code: 'ny', name: 'Chichewa' },
+  { code: 'hr', name: 'Croatian' },
+  { code: 'et', name: 'Estonian' },
+  { code: 'fil', name: 'Filipino' },
+  { code: 'gl', name: 'Galician' },
+  { code: 'ka', name: 'Georgian' },
+  { code: 'ha', name: 'Hausa' },
+  { code: 'is', name: 'Icelandic' },
+  { code: 'ga', name: 'Irish' },
+  { code: 'jv', name: 'Javanese' },
+  { code: 'kk', name: 'Kazakh' },
+  { code: 'ky', name: 'Kyrgyz' },
+  { code: 'lv', name: 'Latvian' },
+  { code: 'ln', name: 'Lingala' },
+  { code: 'lt', name: 'Lithuanian' },
+  { code: 'lb', name: 'Luxembourgish' },
+  { code: 'mk', name: 'Macedonian' },
+  { code: 'ne', name: 'Nepali' },
+  { code: 'ps', name: 'Pashto' },
+  { code: 'sr', name: 'Serbian' },
+  { code: 'sd', name: 'Sindhi' },
+  { code: 'sk', name: 'Slovak' },
+  { code: 'sl', name: 'Slovenian' },
+  { code: 'so', name: 'Somali' },
+  { code: 'cy', name: 'Welsh' }
+];
+
 function normalizeLanguage(langStr: string | null): { code: string | null; name: string | null } {
   if (!langStr) return { code: null, name: null };
   const lower = langStr.toLowerCase().trim();
   
-  if (lower === 'en' || lower === 'english') return { code: 'en', name: 'English' };
-  if (lower === 'ta' || lower === 'tamil') return { code: 'ta', name: 'Tamil' };
-  if (lower === 'es' || lower === 'spanish' || lower === 'español') return { code: 'es', name: 'Spanish' };
-  if (lower === 'hi' || lower === 'hindi') return { code: 'hi', name: 'Hindi' };
-  if (lower === 'fr' || lower === 'french') return { code: 'fr', name: 'French' };
-  if (lower === 'de' || lower === 'german') return { code: 'de', name: 'German' };
-  if (lower === 'zh' || lower === 'chinese' || lower === 'mandarin') return { code: 'zh', name: 'Chinese' };
-  if (lower === 'ja' || lower === 'japanese') return { code: 'ja', name: 'Japanese' };
-  if (lower === 'ko' || lower === 'korean') return { code: 'ko', name: 'Korean' };
-  if (lower === 'it' || lower === 'italian') return { code: 'it', name: 'Italian' };
-  if (lower === 'pt' || lower === 'portuguese') return { code: 'pt', name: 'Portuguese' };
-  if (lower === 'ru' || lower === 'russian') return { code: 'ru', name: 'Russian' };
+  const directMatch = whisperLanguages.find(l => l.code === lower);
+  if (directMatch) return { code: directMatch.code, name: directMatch.name };
+
+  const nameMatch = whisperLanguages.find(l => l.name.toLowerCase() === lower);
+  if (nameMatch) return { code: nameMatch.code, name: nameMatch.name };
+
+  const fuzzyMatch = whisperLanguages.find(l => 
+    lower.includes(l.name.toLowerCase()) || l.name.toLowerCase().includes(lower)
+  );
+  if (fuzzyMatch) return { code: fuzzyMatch.code, name: fuzzyMatch.name };
   
   if (lower.length === 2) {
     return { code: lower, name: langStr };
