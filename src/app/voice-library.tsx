@@ -14,7 +14,7 @@ import * as Haptics from 'expo-haptics';
 import { useRouter } from 'expo-router';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { Ionicons } from '@expo/vector-icons';
-import { useAudioPlayer } from 'expo-audio';
+import { useAudioPlayer, useAudioPlayerStatus } from 'expo-audio';
 
 import { colors } from '../constants/colors';
 import { spacing, layout, shadows } from '../constants/spacing';
@@ -34,6 +34,7 @@ export default function VoiceLibraryScreen() {
 
   // Setup real audio player hook
   const player = useAudioPlayer('');
+  const status = useAudioPlayerStatus(player);
 
   // Fetch Cloned Voices from Supabase
   const { data: clonedVoices = [] } = useQuery<any[]>({
@@ -106,10 +107,13 @@ export default function VoiceLibraryScreen() {
   };
 
   useEffect(() => {
-    if (playingVoiceId && !player.playing && player.currentTime >= player.duration - 0.2) {
+    const isFinished = status.duration > 0 
+      ? status.currentTime >= status.duration - 0.2 
+      : false;
+    if (playingVoiceId && !status.playing && (isFinished || isNaN(status.duration) || status.duration === 0)) {
       setPlayingVoiceId(null);
     }
-  }, [player.playing, player.currentTime]);
+  }, [status.playing, status.currentTime, status.duration]);
 
   const stopAudio = () => {
     player.pause();

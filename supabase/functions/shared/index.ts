@@ -237,9 +237,14 @@ async function requestGeminiMultimodalModel(
 }
 
 // Get Secret with Database Vault Fallback
+const secretCache = new Map<string, string>();
+
 export async function getSecret(name: string): Promise<string> {
   const envVal = Deno.env.get(name);
   if (envVal) return envVal;
+
+  const cached = secretCache.get(name);
+  if (cached) return cached;
 
   try {
     const supabaseUrl = Deno.env.get('SUPABASE_URL') ?? '';
@@ -254,7 +259,10 @@ export async function getSecret(name: string): Promise<string> {
     if (error) {
       throw new Error(`RPC error: ${error.message}`);
     }
-    if (data) return data as string;
+    if (data) {
+      secretCache.set(name, data as string);
+      return data as string;
+    }
   } catch (err) {
     console.error(`Failed to get secret '${name}' from vault fallback:`, err);
   }

@@ -126,10 +126,12 @@ export default function VoiceCloneScreen() {
       Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
     } else {
       // Start
-      const permission = await AudioModule.requestRecordingPermissionsAsync();
-      if (!permission.granted) {
-        Alert.alert('Microphone Access', 'Microphone permissions are required for voice cloning.');
-        return;
+      if (Platform.OS !== 'web') {
+        const permission = await AudioModule.requestRecordingPermissionsAsync();
+        if (!permission.granted) {
+          Alert.alert('Microphone Access', 'Microphone permissions are required for voice cloning.');
+          return;
+        }
       }
 
       setIsRecording(true);

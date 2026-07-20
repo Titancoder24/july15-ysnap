@@ -163,23 +163,31 @@ export async function callEdgeFunction<T = unknown>(
   try {
     const session = await getOrCreateFunctionSession();
 
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 20000); // 20 seconds safety timeout
+
     const { data, error } = await supabase.functions.invoke(functionName, {
       body,
       headers: {
         Authorization: `Bearer ${session.access_token}`,
         ...options?.headers,
       },
+      signal: controller.signal,
     });
+
+    clearTimeout(timeoutId);
 
     if (error) {
       return { data: null, error: await readFunctionError(error) };
     }
 
     return { data: data as T, error: null };
-  } catch (err) {
+  } catch (err: any) {
     return {
       data: null,
-      error: err instanceof Error ? err : new Error('Edge function call failed'),
+      error: err?.name === 'AbortError' 
+        ? new Error('Request timed out after 20 seconds. Please check your network connection.') 
+        : (err instanceof Error ? err : new Error('Edge function call failed')),
     };
   }
 }

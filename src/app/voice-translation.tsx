@@ -11,12 +11,81 @@ import { colors } from '../constants/colors';
 import { typography } from '../constants/typography';
 import { getLanguageByCode, languages } from '../constants/languages';
 import { Ionicons } from '@expo/vector-icons';
-import { AudioModule, useAudioPlayer, RecordingPresets } from 'expo-audio';
+import { AudioModule, useAudioPlayer, useAudioPlayerStatus, RecordingPresets } from 'expo-audio';
 import { useAppAudioRecorder, useAppAudioRecorderState } from '../utils/audioRecorder';
 import { MotionScreen } from '../components/MotionScreen';
 import { elevenLabsService } from '../services/elevenLabs';
 import { callEdgeFunction } from '../lib/supabase';
 import { ReactiveVoiceOrb } from '../components';
+
+const getWordCount = (text: string): number => {
+  if (!text || text.trim() === '') return 0;
+  return text.trim().split(/\s+/).length;
+};
+
+const getSyllableCount = (text: string): number => {
+  if (!text || text.trim() === '') return 0;
+  const words = text.toLowerCase().trim().split(/\s+/);
+  let totalSyllables = 0;
+  
+  for (const word of words) {
+    const cleanWord = word.replace(/[^a-z]/g, '');
+    if (cleanWord.length === 0) continue;
+    if (cleanWord.length <= 3) {
+      totalSyllables += 1;
+      continue;
+    }
+    
+    let syllables = 0;
+    const vowels = 'aeiouy';
+    let prevIsVowel = false;
+    
+    for (let i = 0; i < cleanWord.length; i++) {
+      const char = cleanWord[i];
+      const isVowel = vowels.includes(char);
+      if (isVowel && !prevIsVowel) {
+        syllables++;
+      }
+      prevIsVowel = isVowel;
+    }
+    
+    if (cleanWord.endsWith('e')) {
+      syllables--;
+    }
+    
+    if (cleanWord.endsWith('es') || cleanWord.endsWith('ed')) {
+      if (syllables > 1 && !cleanWord.endsWith('le')) {
+        syllables--;
+      }
+    }
+    
+    if (syllables <= 0) syllables = 1;
+    totalSyllables += syllables;
+  }
+  
+  return totalSyllables;
+};
+
+const downloadAudio = async (url: string | null, defaultFilename: string) => {
+  if (!url) return;
+  try {
+    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+    const res = await fetch(url);
+    const blob = await res.blob();
+    const blobUrl = URL.createObjectURL(blob);
+    
+    const anchor = document.createElement('a');
+    anchor.href = blobUrl;
+    anchor.download = defaultFilename;
+    document.body.appendChild(anchor);
+    anchor.click();
+    document.body.removeChild(anchor);
+    URL.revokeObjectURL(blobUrl);
+  } catch (err) {
+    console.error('Failed to download audio:', err);
+    window.open(url, '_blank');
+  }
+};
 
 export default function VoiceTranslationScreen() {
   const recorder = useAppAudioRecorder({
@@ -52,6 +121,26 @@ export default function VoiceTranslationScreen() {
   const [playbackProgress, setPlaybackProgress] = useState(0); // 0 to 100
   const [outputAudioUrl, setOutputAudioUrl] = useState<string | null>(null);
   const player = useAudioPlayer(outputAudioUrl || '');
+  const status = useAudioPlayerStatus(player);
+  const [progressPercentage, setProgressPercentage] = useState<number | null>(null);
+  const [playingHistoryId, setPlayingHistoryId] = useState<string | null>(null);
+
+  // Fetch recent translation history items for user
+  const { data: recentItems, refetch: refetchRecentItems } = useQuery<any[]>({
+    queryKey: ['recentTranslationItems', user?.id],
+    queryFn: async () => {
+      if (!user?.id) return [];
+      const { data, error } = await supabase
+        .from('translation_items')
+        .select('*')
+        .eq('user_id', user.id)
+        .order('created_at', { ascending: false })
+        .limit(10);
+      if (error) throw error;
+      return data || [];
+    },
+    enabled: !!user?.id,
+  });
 
   const timerRef = useRef<any>(null);
   const waveRef = useRef<any>(null);
@@ -149,24 +238,40 @@ export default function VoiceTranslationScreen() {
   // Sync timeline progress with real audio duration
   useEffect(() => {
     let progressTimer: any;
-    if (isPlaying && player.duration > 0) {
+    if (isPlaying && status.duration > 0) {
       progressTimer = setInterval(() => {
-        const currentProgress = (player.currentTime / player.duration) * 100;
+        const currentProgress = (status.currentTime / status.duration) * 100;
         setPlaybackProgress(Math.min(100, currentProgress));
       }, 50);
     }
     return () => clearInterval(progressTimer);
-  }, [isPlaying, player.currentTime, player.duration]);
+  }, [isPlaying, status.currentTime, status.duration]);
 
   // Handle playback completion
   useEffect(() => {
-    if (isPlaying && !player.playing && player.currentTime >= player.duration - 0.2) {
+    const isFinished = status.duration > 0 
+      ? status.currentTime >= status.duration - 0.2 
+      : false;
+
+    if (isPlaying && !status.playing && (isFinished || isNaN(status.duration) || status.duration === 0)) {
       setIsPlaying(false);
+      setPlayingHistoryId(null);
       setPlaybackProgress(100);
       setTimeout(() => setPlaybackProgress(0), 200);
       setStatusText('Translation ready');
     }
-  }, [player.playing, player.currentTime]);
+  }, [status.playing, status.currentTime, status.duration]);
+
+  // Sync playback speed
+  useEffect(() => {
+    try {
+      if (player) {
+        player.playbackRate = playbackSpeed;
+      }
+    } catch (e) {
+      console.warn("Failed to set playbackRate:", e);
+    }
+  }, [playbackSpeed, player]);
 
   const handleStartRecording = async () => {
     Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Heavy);
@@ -184,10 +289,12 @@ export default function VoiceTranslationScreen() {
     }
     
     try {
-      const status = await AudioModule.requestRecordingPermissionsAsync();
-      if (!status.granted) {
-        Alert.alert('Microphone Access', 'Microphone permissions are required for voice translation.');
-        return;
+      if (Platform.OS !== 'web') {
+        const status = await AudioModule.requestRecordingPermissionsAsync();
+        if (!status.granted) {
+          Alert.alert('Microphone Access', 'Microphone permissions are required for voice translation.');
+          return;
+        }
       }
 
       setTranscription('');
@@ -197,6 +304,9 @@ export default function VoiceTranslationScreen() {
       await recorder.record();
     } catch (e) {
       console.error(e);
+      setIsRecording(false);
+      setStatusText('Ready to record');
+      Alert.alert('Microphone Error', 'Failed to start recording. Please try again.');
     }
   };
 
@@ -204,6 +314,17 @@ export default function VoiceTranslationScreen() {
     Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
     setIsRecording(false);
     setStatusText('Processing audio...');
+    setProgressPercentage(10); // Start progress bar
+
+    let progressInterval = setInterval(() => {
+      setProgressPercentage((prev) => {
+        if (prev === null) return 10;
+        if (prev < 30) return prev + 5; // transcribing stage
+        if (prev < 65) return prev + 3; // translation stage
+        if (prev < 95) return prev + 1; // speech generation stage
+        return prev;
+      });
+    }, 400);
 
     try {
       const completedUri = await recorder.stop();
@@ -223,6 +344,9 @@ export default function VoiceTranslationScreen() {
         sessionId: sessionId || undefined,
       });
 
+      clearInterval(progressInterval);
+      setProgressPercentage(100);
+
       const sourceText = result.source_text;
       const translatedText = result.translated_text;
       setSessionId(result.session_id);
@@ -241,12 +365,81 @@ export default function VoiceTranslationScreen() {
       } else {
         throw new Error('Failed to generate speech output.');
       }
+      queryClient.invalidateQueries({ queryKey: ['recentTranslationItems', user?.id] });
       queryClient.invalidateQueries({ queryKey: ['recentSessions', user?.id] });
       queryClient.invalidateQueries({ queryKey: ['historySessions', user?.id] });
+
+      setTimeout(() => setProgressPercentage(null), 1000);
     } catch (e: any) {
+      clearInterval(progressInterval);
+      setProgressPercentage(null);
       console.error(e);
       setStatusText('Error occurred');
       Alert.alert('Translation Error', e.message || 'An unexpected error occurred during translation.');
+    }
+  };
+
+  const playHistoryItem = async (item: any) => {
+    try {
+      Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+      if (playingHistoryId === item.id) {
+        if (isPlaying) {
+          player.pause();
+          setIsPlaying(false);
+        } else {
+          player.play();
+          setIsPlaying(true);
+        }
+        return;
+      }
+
+      setPlayingHistoryId(item.id);
+      setIsPlaying(true);
+
+      let url = item.signed_url;
+      if (!url) {
+        const { data, error } = await supabase.storage
+          .from('media')
+          .createSignedUrl(item.generated_audio_path, 86400);
+        if (error || !data?.signedUrl) {
+          throw error || new Error('Failed to resolve audio URL');
+        }
+        url = data.signedUrl;
+        item.signed_url = url;
+      }
+
+      player.replace({ uri: url });
+      player.play();
+    } catch (err: any) {
+      setIsPlaying(false);
+      setPlayingHistoryId(null);
+      Alert.alert('Playback Error', err.message || 'Failed to play translation.');
+    }
+  };
+
+  const deleteHistoryItem = async (itemId: string) => {
+    try {
+      Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
+      const { error } = await supabase
+        .from('translation_items')
+        .delete()
+        .eq('id', itemId);
+      if (error) throw error;
+      queryClient.invalidateQueries({ queryKey: ['recentTranslationItems', user?.id] });
+    } catch (err: any) {
+      Alert.alert('Error', 'Failed to delete translation item.');
+    }
+  };
+
+  const loadHistoryItem = (item: any) => {
+    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+    setTranscription(item.source_text);
+    setEditedText(item.source_text);
+    setTranslation(item.translated_text);
+    setSessionId(item.session_id);
+    setTranslationItemId(item.id);
+    if (item.generated_audio_path) {
+      setOutputAudioUrl(item.signed_url || null);
     }
   };
 
@@ -414,30 +607,44 @@ export default function VoiceTranslationScreen() {
 
         {/* Audio Waveform and Timer Box */}
         <View style={styles.visualizerBox}>
-          {isRecording ? (
+          {progressPercentage !== null ? (
+            <View style={{ width: '100%', alignItems: 'center', paddingHorizontal: 10 }}>
+              <Text style={[styles.statusLabel, { marginBottom: 8, color: '#ffffff', fontWeight: '700' }]}>
+                {statusText}
+              </Text>
+              <View style={{ width: '100%', height: 10, borderRadius: 5, backgroundColor: 'rgba(255, 255, 255, 0.15)', overflow: 'hidden', marginVertical: 8 }}>
+                <View style={{ width: `${progressPercentage}%`, height: '100%', backgroundColor: '#ffffff', borderRadius: 5 }} />
+              </View>
+              <Text style={{ fontSize: 16, fontWeight: '700', color: '#ffffff', marginTop: 4 }}>
+                {progressPercentage}%
+              </Text>
+            </View>
+          ) : isRecording ? (
             <Text style={styles.timer}>{formatTime(recordTime)}</Text>
           ) : (
             <View style={{ alignItems: 'center' }}>
               <Text style={styles.statusLabel}>{statusText}</Text>
               {isBusy && !isRecording && (
-                <ActivityIndicator size="small" color={colors.primary} style={{ marginTop: -8, marginBottom: 12 }} />
+                <ActivityIndicator size="small" color="#ffffff" style={{ marginTop: -8, marginBottom: 12 }} />
               )}
             </View>
           )}
 
-          {/* Waveform graphic */}
-          <View style={styles.waveformContainer}>
-            {waveform.map((h, i) => (
-              <View 
-                key={i} 
-                style={[
-                  styles.waveBar, 
-                  { height: h },
-                  isRecording && { backgroundColor: colors.primary }
-                ]} 
-              />
-            ))}
-          </View>
+          {progressPercentage === null && (
+            /* Waveform graphic */
+            <View style={styles.waveformContainer}>
+              {waveform.map((h, i) => (
+                <View 
+                  key={i} 
+                  style={[
+                    styles.waveBar, 
+                    { height: h },
+                    isRecording && { backgroundColor: '#ffffff' }
+                  ]} 
+                />
+              ))}
+            </View>
+          )}
         </View>
 
         {/* Action button orb */}
@@ -447,6 +654,7 @@ export default function VoiceTranslationScreen() {
             metering={recorderState?.metering}
             isPlaying={isPlaying}
             isProcessing={isBusy && !isRecording}
+            baseDiameter={115}
             onPress={isRecording ? handleStopRecording : handleStartRecording}
           />
           <Text style={styles.orbLabel}>
@@ -474,6 +682,11 @@ export default function VoiceTranslationScreen() {
                 </Pressable>
               </View>
               <Text style={styles.transText}>{transcription || 'Transcribing...'}</Text>
+              {transcription !== '' && (
+                <Text style={styles.cardMetadata}>
+                  Words: {getWordCount(transcription)} • Syllables: {getSyllableCount(transcription)}
+                </Text>
+              )}
             </View>
 
             {/* Translation card */}
@@ -484,6 +697,11 @@ export default function VoiceTranslationScreen() {
               <Text style={[styles.transText, { color: colors.textPrimary }]}>
                 {translation || 'Translating...'}
               </Text>
+              {translation !== '' && (
+                <Text style={styles.cardMetadata}>
+                  Words: {getWordCount(translation)} • Syllables: {getSyllableCount(translation)}
+                </Text>
+              )}
               
               {/* Playback Controls widget */}
               {translation !== '' && (
@@ -491,7 +709,13 @@ export default function VoiceTranslationScreen() {
                   {/* Play scrubber */}
                   <View style={styles.scrubberRow}>
                     <Pressable style={styles.playButton} onPress={handleTogglePlayback}>
-                      <Ionicons name={isPlaying ? 'pause' : 'play'} size={20} color={colors.textInverse} />
+                      <Ionicons name={isPlaying ? 'pause' : 'play'} size={20} color="#fff" />
+                    </Pressable>
+                    <Pressable 
+                      style={[styles.playButton, { backgroundColor: colors.accentPurple, marginLeft: 8 }]} 
+                      onPress={() => downloadAudio(outputAudioUrl, `translation-${targetCode}.mp3`)}
+                    >
+                      <Ionicons name="download" size={20} color="#fff" />
                     </Pressable>
                     <View style={styles.scrubberTrack}>
                       <View style={[styles.scrubberFill, { width: `${playbackProgress}%` }]} />
@@ -503,6 +727,79 @@ export default function VoiceTranslationScreen() {
                 </View>
               )}
             </View>
+          </View>
+        )}
+        {/* Recent Translations History */}
+        {recentItems && recentItems.length > 0 && (
+          <View style={styles.historyContainer}>
+            <Text style={styles.historyTitle}>Recent Translations</Text>
+            {recentItems.map((item) => {
+              const isItemPlaying = playingHistoryId === item.id && isPlaying;
+              const sourceLang = getLanguageByCode(item.source_language)?.name || item.source_language || 'Source';
+              const targetLang = getLanguageByCode(item.target_language)?.name || item.target_language || 'Target';
+              
+              return (
+                <Pressable 
+                  key={item.id} 
+                  style={styles.historyCard}
+                  onPress={() => loadHistoryItem(item)}
+                >
+                  <View style={styles.historyHeader}>
+                    <View style={styles.historyLanguages}>
+                      <Text style={styles.historyLangText}>{sourceLang}</Text>
+                      <Ionicons name="arrow-forward" style={styles.historyArrow} />
+                      <Text style={[styles.historyLangText, { color: colors.accentPurple }]}>{targetLang}</Text>
+                    </View>
+                    <Text style={styles.historyTimestamp}>
+                      {new Date(item.created_at).toLocaleDateString()}
+                    </Text>
+                  </View>
+
+                  <View style={styles.historyBody}>
+                    <Text style={styles.historySourceText} numberOfLines={2}>{item.source_text}</Text>
+                    <Text style={styles.historyTargetText} numberOfLines={2}>{item.translated_text}</Text>
+                    <Text style={styles.historyMetadata}>
+                      Words: {getWordCount(item.translated_text)} • Syllables: {getSyllableCount(item.translated_text)}
+                    </Text>
+                  </View>
+
+                  <View style={styles.historyActions}>
+                    <Pressable 
+                      style={[styles.historyPlayBtn, isItemPlaying && { backgroundColor: colors.accentPurple }]} 
+                      onPress={() => playHistoryItem(item)}
+                    >
+                      <Ionicons name={isItemPlaying ? 'pause' : 'play'} size={14} color="#fff" />
+                      <Text style={styles.historyPlayBtnText}>{isItemPlaying ? 'Playing' : 'Listen'}</Text>
+                    </Pressable>
+                    <Pressable 
+                      style={[styles.historyPlayBtn, { backgroundColor: colors.surfaceSoft, borderWidth: 1, borderColor: colors.border }]} 
+                      onPress={async () => {
+                        let url = item.signed_url;
+                        if (!url) {
+                          const { data } = await supabase.storage
+                            .from('media')
+                            .createSignedUrl(item.generated_audio_path, 86400);
+                          url = data?.signedUrl || null;
+                          item.signed_url = url;
+                        }
+                        if (url) {
+                          downloadAudio(url, `translation-history-${item.id}.mp3`);
+                        }
+                      }}
+                    >
+                      <Ionicons name="download-outline" size={14} color={colors.textSecondary} />
+                      <Text style={[styles.historyPlayBtnText, { color: colors.textSecondary }]}>Download</Text>
+                    </Pressable>
+                    <Pressable 
+                      style={styles.historyDeleteBtn} 
+                      onPress={() => deleteHistoryItem(item.id)}
+                    >
+                      <Ionicons name="trash-outline" size={16} color={colors.textMuted} />
+                    </Pressable>
+                  </View>
+                </Pressable>
+              );
+            })}
           </View>
         )}
       </ScrollView>
@@ -614,17 +911,23 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'space-between',
-    backgroundColor: colors.backgroundSoft,
-    borderWidth: 0,
-    paddingVertical: 10,
-    paddingHorizontal: 12,
-    borderRadius: 12,
+    backgroundColor: '#fff',
+    borderWidth: 1,
+    borderColor: colors.border,
+    paddingVertical: 16,
+    paddingHorizontal: 20,
+    borderRadius: 20,
     marginBottom: 24,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.03,
+    shadowRadius: 8,
+    elevation: 2,
   },
   langTag: {
-    fontSize: 14,
-    fontFamily: typography.bodySemibold.fontFamily,
-    fontWeight: '700',
+    fontSize: 19,
+    fontFamily: typography.heading3.fontFamily,
+    fontWeight: '800',
     color: colors.textPrimary,
   },
   languageChoice: {
@@ -632,70 +935,77 @@ const styles = StyleSheet.create({
     paddingHorizontal: 6,
   },
   languageChoiceLabel: {
-    fontSize: 9,
+    fontSize: 10,
     fontFamily: typography.captionMedium.fontFamily,
-    fontWeight: '700',
+    fontWeight: '800',
     color: colors.textMuted,
-    letterSpacing: 1.1,
-    marginBottom: 3,
+    letterSpacing: 1.2,
+    marginBottom: 4,
   },
   languageChoiceRow: {
     flexDirection: 'row',
     alignItems: 'center',
-    gap: 5,
+    gap: 6,
   },
   swapButton: {
-    width: 38,
-    height: 38,
-    borderRadius: 19,
+    width: 44,
+    height: 44,
+    borderRadius: 22,
     alignItems: 'center',
     justifyContent: 'center',
-    backgroundColor: colors.surface,
+    backgroundColor: '#f3f4f6',
   },
   disabledControl: {
     opacity: 0.4,
   },
   visualizerBox: {
     alignItems: 'center',
-    backgroundColor: colors.backgroundSoft,
-    borderRadius: 20,
-    borderWidth: 0,
-    padding: 24,
+    backgroundColor: '#000000',
+    borderRadius: 24,
+    padding: 28,
     marginBottom: 28,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 12 },
+    shadowOpacity: 0.15,
+    shadowRadius: 16,
+    elevation: 8,
+    borderWidth: 1,
+    borderColor: '#000000',
   },
   timer: {
-    fontSize: 32,
+    fontSize: 36,
     fontFamily: typography.tabular.fontFamily,
-    fontWeight: '700',
-    color: colors.primary,
+    fontWeight: '800',
+    color: '#ffffff',
     marginBottom: 16,
   },
   statusLabel: {
-    fontSize: 15,
+    fontSize: 16,
     fontFamily: typography.bodyMedium.fontFamily,
-    color: colors.textSecondary,
+    fontWeight: '700',
+    color: '#ffffff',
     marginBottom: 16,
   },
   waveformContainer: {
     flexDirection: 'row',
-    height: 60,
+    height: 70,
     alignItems: 'center',
-    gap: 4,
+    gap: 5,
   },
   waveBar: {
-    width: 4,
-    borderRadius: 2,
-    backgroundColor: colors.borderStrong,
-    minHeight: 6,
+    width: 5,
+    borderRadius: 3,
+    backgroundColor: 'rgba(255, 255, 255, 0.2)',
+    minHeight: 8,
   },
   orbSection: {
     alignItems: 'center',
     marginBottom: 32,
   },
   recordingOrbIdle: {
-    width: 76,
-    height: 76,
-    borderRadius: 38,
+    width: 90,
+    height: 90,
+    borderRadius: 45,
     backgroundColor: colors.primary,
     justifyContent: 'center',
     alignItems: 'center',
@@ -707,9 +1017,9 @@ const styles = StyleSheet.create({
     marginBottom: 12,
   },
   recordingOrbActive: {
-    width: 76,
-    height: 76,
-    borderRadius: 38,
+    width: 90,
+    height: 90,
+    borderRadius: 45,
     backgroundColor: colors.error,
     justifyContent: 'center',
     alignItems: 'center',
@@ -727,34 +1037,43 @@ const styles = StyleSheet.create({
     borderRadius: 4,
   },
   orbLabel: {
-    fontSize: 14,
+    fontSize: 15,
     fontFamily: typography.bodyMedium.fontFamily,
-    color: colors.textMuted,
+    color: colors.textSecondary,
+    fontWeight: '700',
+    marginTop: 8,
   },
   resultGroup: {
-    gap: 16,
-    marginBottom: 20,
+    gap: 20,
+    marginBottom: 24,
   },
   card: {
-    backgroundColor: colors.backgroundSoft,
-    borderRadius: 16,
-    borderWidth: 0,
-    padding: 16,
+    backgroundColor: '#fff',
+    borderRadius: 20,
+    borderWidth: 1,
+    borderColor: colors.border,
+    padding: 20,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.02,
+    shadowRadius: 8,
+    elevation: 2,
   },
   translationCard: {
-    backgroundColor: colors.surfaceSuccess,
-    borderColor: colors.successLight,
+    backgroundColor: '#faf5ff',
+    borderColor: '#e9d5ff',
+    borderWidth: 1.5,
   },
   cardHeader: {
     flexDirection: 'row',
     justifyContent: 'space-between',
     alignItems: 'center',
-    marginBottom: 10,
+    marginBottom: 12,
   },
   cardHeaderTitle: {
     fontSize: 11,
     fontFamily: typography.captionMedium.fontFamily,
-    fontWeight: '700',
+    fontWeight: '800',
     color: colors.textMuted,
     letterSpacing: 1.5,
   },
@@ -768,10 +1087,11 @@ const styles = StyleSheet.create({
     color: colors.accentPurple,
   },
   transText: {
-    fontSize: 16,
+    fontSize: 18,
     fontFamily: typography.body.fontFamily,
-    color: colors.textSecondary,
-    lineHeight: 22,
+    fontWeight: '700',
+    color: colors.textPrimary,
+    lineHeight: 26,
   },
   playbackContainer: {
     marginTop: 16,
@@ -962,5 +1282,149 @@ const styles = StyleSheet.create({
     fontWeight: '600',
     color: colors.textSecondary,
     letterSpacing: 0.5,
+  },
+  progressContainer: {
+    backgroundColor: '#fff',
+    borderRadius: 12,
+    padding: 16,
+    marginVertical: 10,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.05,
+    shadowRadius: 8,
+    elevation: 2,
+  },
+  progressRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginBottom: 8,
+  },
+  progressLabel: {
+    fontSize: 14,
+    fontWeight: '600',
+    color: '#1f2937',
+  },
+  progressValue: {
+    fontSize: 14,
+    fontWeight: '700',
+    color: colors.primary,
+  },
+  progressBarBg: {
+    height: 8,
+    backgroundColor: '#f3f4f6',
+    borderRadius: 4,
+    overflow: 'hidden',
+  },
+  progressBarFill: {
+    height: '100%',
+    backgroundColor: colors.primary,
+    borderRadius: 4,
+  },
+  historyContainer: {
+    marginTop: 24,
+    paddingTop: 24,
+    borderTopWidth: 1,
+    borderTopColor: colors.border,
+    paddingHorizontal: 4,
+    marginBottom: 40,
+  },
+  historyTitle: {
+    fontSize: 18,
+    fontFamily: typography.heading3.fontFamily,
+    fontWeight: '700',
+    color: colors.textPrimary,
+    marginBottom: 16,
+  },
+  historyCard: {
+    backgroundColor: '#fff',
+    borderRadius: 16,
+    padding: 16,
+    marginBottom: 12,
+    borderWidth: 1,
+    borderColor: colors.border,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.03,
+    shadowRadius: 6,
+    elevation: 1,
+  },
+  historyHeader: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginBottom: 10,
+  },
+  historyLanguages: {
+    flexDirection: 'row',
+    alignItems: 'center',
+  },
+  historyLangText: {
+    fontSize: 12,
+    fontWeight: '600',
+    color: colors.textSecondary,
+    backgroundColor: colors.backgroundSoft,
+    paddingHorizontal: 8,
+    paddingVertical: 3,
+    borderRadius: 8,
+  },
+  historyArrow: {
+    marginHorizontal: 6,
+    fontSize: 12,
+    color: colors.textMuted,
+  },
+  historyTimestamp: {
+    fontSize: 10,
+    color: colors.textMuted,
+  },
+  historyBody: {
+    marginBottom: 12,
+  },
+  historySourceText: {
+    fontSize: 14,
+    color: colors.textSecondary,
+    marginBottom: 6,
+    fontStyle: 'italic',
+  },
+  historyTargetText: {
+    fontSize: 15,
+    fontWeight: '600',
+    color: colors.textPrimary,
+  },
+  historyActions: {
+    flexDirection: 'row',
+    justifyContent: 'flex-end',
+    borderTopWidth: 1,
+    borderTopColor: '#f3f4f6',
+    paddingTop: 10,
+  },
+  historyPlayBtn: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: colors.primary,
+    paddingVertical: 6,
+    paddingHorizontal: 12,
+    borderRadius: 20,
+    marginRight: 8,
+  },
+  historyPlayBtnText: {
+    color: '#fff',
+    fontSize: 12,
+    fontWeight: '600',
+    marginLeft: 4,
+  },
+  historyDeleteBtn: {
+    padding: 6,
+  },
+  cardMetadata: {
+    fontSize: 12,
+    color: colors.textMuted,
+    marginTop: 8,
+    alignSelf: 'flex-start',
+  },
+  historyMetadata: {
+    fontSize: 11,
+    color: colors.textMuted,
+    marginTop: 6,
   },
 });

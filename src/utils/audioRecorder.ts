@@ -10,20 +10,26 @@ import {
 function getSupportedMimeType(): string {
   if (Platform.OS !== 'web') return 'audio/wav';
   
+  if (typeof MediaRecorder === 'undefined') {
+    return 'audio/mp4';
+  }
+  
   const types = [
     'audio/webm;codecs=opus',
     'audio/webm',
-    'audio/ogg;codecs=opus',
     'audio/mp4',
+    'audio/aac',
     'audio/wav'
   ];
   
   for (const type of types) {
-    if (typeof MediaRecorder !== 'undefined' && MediaRecorder.isTypeSupported(type)) {
-      return type;
-    }
+    try {
+      if (MediaRecorder.isTypeSupported(type)) {
+        return type;
+      }
+    } catch (e) {}
   }
-  return 'audio/webm';
+  return 'audio/mp4'; // Safest universal standard fallback (works on iOS and Android)
 }
 
 export interface AppRecorder {
@@ -102,7 +108,10 @@ export function useAppAudioRecorder(options: { isMeteringEnabled?: boolean } = {
       mediaStreamRef.current = stream;
 
       const mimeType = getSupportedMimeType();
-      const recorder = new MediaRecorder(stream, { mimeType });
+      const recorder = new MediaRecorder(stream, { 
+        mimeType,
+        audioBitsPerSecond: 64000 // Compress to 64 kbps (perfect for voice, 10x smaller file sizes)
+      });
       mediaRecorderRef.current = recorder;
       chunksRef.current = [];
 
@@ -118,8 +127,14 @@ export function useAppAudioRecorder(options: { isMeteringEnabled?: boolean } = {
         setUri(objectUrl);
       };
 
-      // Set up metering (Web Audio API)
-      if (options.isMeteringEnabled !== false) {
+      const isIOSWeb = Platform.OS === 'web' && 
+        (typeof navigator !== 'undefined' && (
+          /iPad|iPhone|iPod/.test(navigator.userAgent) || 
+          (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1)
+        ));
+
+      // Set up metering (Web Audio API) - Bypassed on iOS Web to prevent Safari/Chrome recording silencing bugs
+      if (options.isMeteringEnabled !== false && !isIOSWeb) {
         try {
           const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext;
           const audioContext = new AudioContextClass();
@@ -152,7 +167,12 @@ export function useAppAudioRecorder(options: { isMeteringEnabled?: boolean } = {
         }
       }
 
-      recorder.start(100); // chunk every 100ms
+      try {
+        recorder.start(100); // chunk every 100ms
+      } catch (startErr) {
+        console.warn("MediaRecorder start with timeslice failed, falling back:", startErr);
+        recorder.start();
+      }
       setIsRecording(true);
       setCurrentTime(0);
 
@@ -176,7 +196,13 @@ export function useAppAudioRecorder(options: { isMeteringEnabled?: boolean } = {
     }
 
     const completedUri = await new Promise<string | null>((resolve) => {
+      const stopTimeout = setTimeout(() => {
+        console.warn("MediaRecorder stop callback timed out. Resolving fallback.");
+        resolve(uri);
+      }, 2000);
+
       activeRecorder.onstop = () => {
+        clearTimeout(stopTimeout);
         const finalBlob = new Blob(chunksRef.current, { type: activeRecorder.mimeType || getSupportedMimeType() });
         const objectUrl = URL.createObjectURL(finalBlob);
         setUri(objectUrl);

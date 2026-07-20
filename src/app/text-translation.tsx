@@ -59,6 +59,71 @@ export default function TextTranslationScreen() {
     enabled: !!user?.id,
   });
 
+  // Fetch text translation history
+  const { data: recentTextItems = [], refetch: refetchHistory } = useQuery<any[]>({
+    queryKey: ['textHistory', user?.id],
+    queryFn: async () => {
+      if (!user?.id) return [];
+      const { data, error } = await supabase
+        .from('translation_items')
+        .select(`
+          id,
+          created_at,
+          source_text,
+          translated_text,
+          detected_language,
+          source_language,
+          target_language,
+          transliteration,
+          context_notes,
+          alternatives,
+          translation_sessions (
+            id,
+            session_type
+          )
+        `)
+        .eq('user_id', user.id)
+        .order('created_at', { ascending: false })
+        .limit(20);
+      if (error) {
+        console.error('Failed to fetch history:', error);
+        return [];
+      }
+      return (data || []).filter((item: any) => 
+        item.translation_sessions?.session_type === 'text'
+      );
+    },
+    enabled: !!user?.id,
+  });
+
+  const loadHistoryItem = (item: any) => {
+    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+    setSourceText(item.source_text);
+    setTranslationResult({
+      id: item.id,
+      translated: item.translated_text,
+      transliteration: item.transliteration || '',
+      alternatives: item.alternatives || [],
+      notes: item.context_notes || '',
+    });
+    if (item.source_language) setSelectedSourceLanguage(item.source_language);
+    if (item.target_language) setSelectedTargetLanguage(item.target_language);
+  };
+
+  const deleteHistoryItem = async (itemId: string) => {
+    try {
+      Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
+      const { error } = await supabase
+        .from('translation_items')
+        .delete()
+        .eq('id', itemId);
+      if (error) throw error;
+      refetchHistory();
+    } catch (e) {
+      console.error('Error deleting history item:', e);
+    }
+  };
+
   const currentBookmark = bookmarks.find(b => b.translation_item_id === translationResult?.id);
   const isBookmarked = !!currentBookmark;
 
@@ -132,6 +197,7 @@ export default function TextTranslationScreen() {
       });
       setTranslating(false);
       Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+      refetchHistory();
       const { data: currentUserData } = await supabase.auth.getUser();
       const currentUserId = user?.id || currentUserData.user?.id;
       if (currentUserId) queryClient.invalidateQueries({ queryKey: ['recentSessions', currentUserId] });
@@ -578,9 +644,52 @@ export default function TextTranslationScreen() {
                     );
                   })
                 )}
-              </View>
             </View>
-          )}
+          </View>
+        )}
+        {/* Recent Translations History */}
+        {recentTextItems && recentTextItems.length > 0 && (
+          <View style={styles.historyContainer}>
+            <Text style={styles.historyTitle}>Recent Translations</Text>
+            {recentTextItems.map((item) => {
+              const sourceLang = getLanguageByCode(item.source_language)?.name || item.source_language || 'Source';
+              const targetLang = getLanguageByCode(item.target_language)?.name || item.target_language || 'Target';
+              
+              return (
+                <Pressable 
+                  key={item.id} 
+                  style={styles.historyCard}
+                  onPress={() => loadHistoryItem(item)}
+                >
+                  <View style={styles.historyHeader}>
+                    <View style={styles.historyLanguages}>
+                      <Text style={styles.historyLangText}>{sourceLang}</Text>
+                      <Ionicons name="arrow-forward" style={styles.historyArrow} />
+                      <Text style={[styles.historyLangText, { color: colors.accentPurple }]}>{targetLang}</Text>
+                    </View>
+                    <Text style={styles.historyTimestamp}>
+                      {new Date(item.created_at).toLocaleDateString()}
+                    </Text>
+                  </View>
+
+                  <View style={styles.historyBody}>
+                    <Text style={styles.historySourceText} numberOfLines={2}>{item.source_text}</Text>
+                    <Text style={styles.historyTargetText} numberOfLines={2}>{item.translated_text}</Text>
+                  </View>
+
+                  <View style={styles.historyActions}>
+                    <Pressable 
+                      style={styles.historyDeleteBtn} 
+                      onPress={() => deleteHistoryItem(item.id)}
+                    >
+                      <Ionicons name="trash-outline" size={16} color={colors.textMuted} />
+                    </Pressable>
+                  </View>
+                </Pressable>
+              );
+            })}
+          </View>
+        )}
         </ScrollView>
       </KeyboardAvoidingView>
 
@@ -1214,5 +1323,85 @@ const styles = StyleSheet.create({
     fontSize: 15,
     fontWeight: '700',
     color: colors.textInverse,
+  },
+  historyContainer: {
+    marginTop: 24,
+    paddingTop: 24,
+    borderTopWidth: 1,
+    borderTopColor: colors.border,
+    paddingHorizontal: 4,
+    marginBottom: 40,
+  },
+  historyTitle: {
+    fontSize: 18,
+    fontFamily: typography.heading3.fontFamily,
+    fontWeight: '700',
+    color: colors.textPrimary,
+    marginBottom: 16,
+  },
+  historyCard: {
+    backgroundColor: '#fff',
+    borderRadius: 16,
+    padding: 16,
+    marginBottom: 12,
+    borderWidth: 1,
+    borderColor: colors.border,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.03,
+    shadowRadius: 6,
+    elevation: 1,
+  },
+  historyHeader: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginBottom: 10,
+  },
+  historyLanguages: {
+    flexDirection: 'row',
+    alignItems: 'center',
+  },
+  historyLangText: {
+    fontSize: 12,
+    fontWeight: '600',
+    color: colors.textSecondary,
+    backgroundColor: colors.backgroundSoft,
+    paddingHorizontal: 8,
+    paddingVertical: 3,
+    borderRadius: 8,
+  },
+  historyArrow: {
+    marginHorizontal: 6,
+    fontSize: 12,
+    color: colors.textMuted,
+  },
+  historyTimestamp: {
+    fontSize: 10,
+    color: colors.textMuted,
+  },
+  historyBody: {
+    marginBottom: 12,
+  },
+  historySourceText: {
+    fontSize: 14,
+    color: colors.textSecondary,
+    marginBottom: 6,
+    fontStyle: 'italic',
+  },
+  historyTargetText: {
+    fontSize: 15,
+    fontWeight: '600',
+    color: colors.textPrimary,
+  },
+  historyActions: {
+    flexDirection: 'row',
+    justifyContent: 'flex-end',
+    borderTopWidth: 1,
+    borderTopColor: '#f3f4f6',
+    paddingTop: 10,
+  },
+  historyDeleteBtn: {
+    padding: 6,
   },
 });

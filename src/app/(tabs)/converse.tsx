@@ -21,10 +21,10 @@ import { useRouter } from 'expo-router';
 import * as Haptics from 'expo-haptics';
 
 import { colors, spacing, typography } from '../../constants';
-import { supabase } from '../../lib/supabase';
+import { supabase, callEdgeFunction } from '../../lib/supabase';
 import { useAuth } from '../../contexts/AuthContext';
 import { useAppAudioRecorder } from '../../utils/audioRecorder';
-import { AudioModule, useAudioPlayer } from 'expo-audio';
+import { AudioModule, useAudioPlayer, useAudioPlayerStatus } from 'expo-audio';
 import { elevenLabsService } from '../../services/elevenLabs';
 import { getLanguageName, languages } from '../../constants/languages';
 
@@ -33,10 +33,13 @@ const { width } = Dimensions.get('window');
 interface DictationTurn {
   id: string;
   text: string;
+  translatedText?: string;
   detectedLanguage: string;
   detectedLanguageName: string;
+  targetLanguage: string;
+  targetLanguageName: string;
   originalAudioUrl?: string;
-  translatedAudioUrl?: string; // TTS playback url
+  translatedAudioUrl?: string; // TTS playback url of translated text
   createdAt: string;
 }
 
@@ -46,13 +49,16 @@ export default function ConverseTab() {
 
   // Media players & recorders
   const player = useAudioPlayer();
+  const status = useAudioPlayerStatus(player);
   const recorder = useAppAudioRecorder();
 
   // App State
   const [text, setText] = useState<string>('');
+  const [translatedText, setTranslatedText] = useState<string>('');
   const [detectedLangCode, setDetectedLangCode] = useState<string>('');
   const [detectedLangName, setDetectedLangName] = useState<string>('');
-  
+  const [targetLangCode, setTargetLangCode] = useState<string>('en'); // Default target: English
+
   const [isRecording, setIsRecording] = useState(false);
   const [processingState, setProcessingState] = useState<'idle' | 'recording' | 'transcribing' | 'speaking' | 'error'>('idle');
   const [statusText, setStatusText] = useState('');
@@ -64,29 +70,42 @@ export default function ConverseTab() {
   // History logs
   const [turns, setTurns] = useState<DictationTurn[]>([]);
   const [showHistory, setShowHistory] = useState(false);
+  const [showLangPicker, setShowLangPicker] = useState(false);
 
   // VAD Stopwatch / silence detection emulator for client
   const [elapsedSeconds, setElapsedSeconds] = useState(0);
   const timerRef = useRef<NodeJS.Timeout | null>(null);
 
-  // Sync profile voice
-  const [profile, setProfile] = useState<any>(null);
+  // Sync preferences voice
+  const [preferences, setPreferences] = useState<any>(null);
 
   useEffect(() => {
     if (user) {
       supabase
-        .from('profiles')
+        .from('user_preferences')
         .select('*')
-        .eq('id', user.id)
+        .eq('user_id', user.id)
         .single()
         .then(({ data }) => {
-          if (data) setProfile(data);
+          if (data) setPreferences(data);
         });
       
       // Load history
       loadHistory();
     }
   }, [user]);
+
+  // Handle playback completion to release recording buttons
+  useEffect(() => {
+    const isFinished = status.duration > 0 
+      ? status.currentTime >= status.duration - 0.2 
+      : false;
+    
+    if (processingState === 'speaking' && !status.playing && (isFinished || isNaN(status.duration) || status.duration === 0)) {
+      setProcessingState('idle');
+      setStatusText('');
+    }
+  }, [status.playing, status.currentTime, status.duration, processingState]);
 
   // Recording timer
   useEffect(() => {
@@ -129,8 +148,11 @@ export default function ConverseTab() {
         const loaded: DictationTurn[] = data.map((row: any) => ({
           id: row.id,
           text: row.source_text || '',
+          translatedText: row.translated_text || '',
           detectedLanguage: row.detected_language || '',
           detectedLanguageName: row.detected_language_name || 'English',
+          targetLanguage: row.target_language || '',
+          targetLanguageName: row.target_language ? getLanguageName(row.target_language) : '',
           originalAudioUrl: row.source_audio_path || undefined,
           translatedAudioUrl: row.generated_audio_path || undefined,
           createdAt: row.created_at,
@@ -179,7 +201,6 @@ export default function ConverseTab() {
   const saveDictationToDb = async (turn: DictationTurn) => {
     if (!user) return;
     try {
-      // Insert into translation_items to integrate with the existing database schema
       const { error } = await supabase
         .from('translation_items')
         .insert({
@@ -188,10 +209,11 @@ export default function ConverseTab() {
           speaker_id: 'A',
           sequence_number: turns.length + 1,
           source_text: turn.text,
+          translated_text: turn.translatedText || null,
           detected_language: turn.detectedLanguage || null,
           detected_language_name: turn.detectedLanguageName || null,
           source_language: turn.detectedLanguage,
-          target_language: turn.detectedLanguage,
+          target_language: turn.targetLanguage || turn.detectedLanguage,
           source_panel: 'first',
           detection_mode: 'provider',
           status: 'complete',
@@ -228,10 +250,12 @@ export default function ConverseTab() {
       console.log("Error pausing player:", e);
     }
 
-    const permission = await AudioModule.requestRecordingPermissionsAsync();
-    if (!permission.granted) {
-      Alert.alert('Permission Denied', 'Microphone recording permission is required.');
-      return;
+    if (Platform.OS !== 'web') {
+      const permission = await AudioModule.requestRecordingPermissionsAsync();
+      if (!permission.granted) {
+        Alert.alert('Permission Denied', 'Microphone recording permission is required.');
+        return;
+      }
     }
 
     try {
@@ -295,27 +319,57 @@ export default function ConverseTab() {
       setDetectedLangCode(langCode);
       setDetectedLangName(langName);
 
+      // 3. Translate from Spoken Language to Target Language
+      let translated = '';
+      if (langCode.toLowerCase().trim() !== targetLangCode.toLowerCase().trim()) {
+        setProcessingState('transcribing');
+        setStatusText(`Translating to ${getLanguageName(targetLangCode)}...`);
+        try {
+          const { data: translationResult, error: transError } = await callEdgeFunction<{
+            translated_text: string;
+          }>('translate-text', {
+            source: langCode,
+            target: targetLangCode,
+            text: result.text,
+          });
+
+          if (transError || !translationResult) {
+            throw transError || new Error('Translation failed');
+          }
+          translated = translationResult.translated_text;
+        } catch (transErr) {
+          console.error("Translation failed:", transErr);
+          translated = '[Translation Failed]';
+        }
+      } else {
+        translated = result.text; // Same language
+      }
+      setTranslatedText(translated);
+
       // Create new turn object
       const newTurn: DictationTurn = {
         id: Math.random().toString(36).substring(7),
         text: result.text,
+        translatedText: translated,
         detectedLanguage: langCode,
         detectedLanguageName: langName,
+        targetLanguage: targetLangCode,
+        targetLanguageName: getLanguageName(targetLangCode),
         originalAudioUrl: originalAudioUrl || undefined,
         createdAt: new Date().toISOString(),
       };
 
       setTurns(prev => [newTurn, ...prev]);
 
-      // 3. Generate voice play-back in native language if autoPlay is enabled
+      // 4. Generate voice playback in target language if autoPlay is enabled
       let translatedAudioUrl = '';
-      if (autoPlay) {
+      if (autoPlay && translated && translated !== '[Translation Failed]') {
         setProcessingState('speaking');
-        setStatusText(`Playing back text...`);
+        setStatusText(`Playing playback voice...`);
         try {
           const ttsResult = await elevenLabsService.generateSpeech(
-            result.text,
-            profile?.selected_voice_id || '21m00Tcm4TlvDq8ikWAM',
+            translated,
+            preferences?.selected_voice_id || '21m00Tcm4TlvDq8ikWAM',
             true
           );
           if (ttsResult && ttsResult.url) {
@@ -330,7 +384,7 @@ export default function ConverseTab() {
         }
       }
 
-      // 4. Save turn to database
+      // 5. Save turn to database
       await saveDictationToDb(newTurn);
 
       setProcessingState('idle');
@@ -343,32 +397,35 @@ export default function ConverseTab() {
     }
   };
 
-  const handleCopyText = async () => {
-    if (!text) return;
-    Clipboard.setString(text);
+  const handleCopyText = async (targetText: string) => {
+    if (!targetText) return;
+    Clipboard.setString(targetText);
     Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
-    Alert.alert('Copied', 'Transcribed text copied to clipboard.');
+    Alert.alert('Copied', 'Text copied to clipboard.');
   };
 
   const handleShareText = async () => {
     if (!text) return;
+    const shareMessage = translatedText && translatedText !== text 
+      ? `Spoken (${detectedLangName}): ${text}\n\nTranslation (${getLanguageName(targetLangCode)}): ${translatedText}`
+      : text;
     try {
       await Share.share({
-        message: text,
+        message: shareMessage,
       });
     } catch (e) {
       console.error("Error sharing text:", e);
     }
   };
 
-  const handlePlayTTS = async () => {
-    if (!text) return;
+  const handlePlayTTS = async (audioText: string, playTarget: boolean) => {
+    if (!audioText) return;
     setProcessingState('speaking');
     setStatusText('Generating audio speech...');
     try {
       const ttsResult = await elevenLabsService.generateSpeech(
-        text,
-        profile?.selected_voice_id || '21m00Tcm4TlvDq8ikWAM',
+        audioText,
+        preferences?.selected_voice_id || '21m00Tcm4TlvDq8ikWAM',
         true
       );
       if (ttsResult && ttsResult.url) {
@@ -386,44 +443,62 @@ export default function ConverseTab() {
   const handleClearText = () => {
     Haptics.selectionAsync();
     setText('');
+    setTranslatedText('');
     setDetectedLangCode('');
     setDetectedLangName('');
     setProcessingState('idle');
     setStatusText('');
   };
 
+  const selectTargetLanguage = (code: string) => {
+    Haptics.selectionAsync();
+    setTargetLangCode(code);
+    setShowLangPicker(false);
+  };
+
   return (
     <SafeAreaView style={styles.container}>
-      <StatusBar style="light" />
+      <StatusBar style="dark" />
 
       {/* Header */}
       <View style={styles.header}>
         <Pressable style={styles.headerBtn} onPress={() => router.back()}>
-          <Ionicons name="arrow-back" size={24} color="#FFFFFF" />
+          <Ionicons name="arrow-back" size={24} color="#1A1A1C" />
         </Pressable>
-        <Text style={styles.headerTitle}>YSnap dictation</Text>
+        <Text style={styles.headerTitle}>YSnap Dictate</Text>
         <Pressable style={styles.headerBtn} onPress={() => setShowHistory(true)}>
-          <Ionicons name="time-outline" size={24} color="#FFFFFF" />
+          <Ionicons name="time-outline" size={24} color="#1A1A1C" />
         </Pressable>
       </View>
 
       <ScrollView contentContainerStyle={styles.scrollContainer} keyboardShouldPersistTaps="handled">
         {/* Editor Board Card */}
         <View style={styles.dictationBoard}>
-          {/* Detected Language Indicator Banner */}
-          {detectedLangName ? (
-            <View style={styles.detectedBadgeRow}>
-              <Ionicons name="earth" size={16} color={colors.accentBlue} style={{ marginRight: 6 }} />
-              <Text style={styles.detectedBadgeText}>Detected Language: <Text style={{ color: colors.accentBlue, fontWeight: '700' }}>{detectedLangName}</Text></Text>
-            </View>
-          ) : (
-            <View style={styles.detectedBadgeRow}>
-              <Ionicons name="sparkles" size={16} color="rgba(255, 255, 255, 0.4)" style={{ marginRight: 6 }} />
-              <Text style={styles.detectedBadgePlaceholder}>Auto-detecting voice language...</Text>
-            </View>
-          )}
+          
+          {/* Header config: Language status + Target selector */}
+          <View style={styles.boardConfigRow}>
+            {detectedLangName ? (
+              <View style={styles.detectedBadge}>
+                <Ionicons name="earth" size={13} color={colors.accentBlue} style={{ marginRight: 4 }} />
+                <Text style={styles.detectedLabelTxt}>From: <Text style={{ color: colors.accentBlue, fontWeight: '700' }}>{detectedLangName}</Text></Text>
+              </View>
+            ) : (
+              <View style={styles.detectedBadge}>
+                <Ionicons name="sparkles" size={13} color="rgba(0, 0, 0, 0.4)" style={{ marginRight: 4 }} />
+                <Text style={styles.detectedPlaceholderTxt}>Auto-Detecting Input</Text>
+              </View>
+            )}
 
-          {/* Text Area */}
+            <View style={styles.targetLangSelector}>
+              <Text style={styles.toLabel}>To:</Text>
+              <Pressable style={styles.langSelectorBtn} onPress={() => setShowLangPicker(true)}>
+                <Text style={styles.langSelectorBtnTxt}>{getLanguageName(targetLangCode)}</Text>
+                <Ionicons name="chevron-down" size={12} color="#1A1A1C" style={{ marginLeft: 3 }} />
+              </Pressable>
+            </View>
+          </View>
+
+          {/* Text Area containing spoken (and optional translated) text */}
           <ScrollView 
             style={styles.textContainer}
             contentContainerStyle={styles.textScrollContent}
@@ -435,36 +510,69 @@ export default function ConverseTab() {
                 <Text style={styles.loadingText}>{statusText}</Text>
               </View>
             ) : text ? (
-              <Text style={styles.dictatedText}>{text}</Text>
+              <View style={styles.dualTextContainer}>
+                
+                {/* Spoken Text Block */}
+                <View style={styles.textBlock}>
+                  <View style={styles.textBlockHeader}>
+                    <Text style={styles.textBlockTitle}>SPOKEN TEXT ({detectedLangName.toUpperCase()})</Text>
+                    <View style={styles.textBlockActions}>
+                      <Pressable style={styles.blockActionCircle} onPress={() => handleCopyText(text)}>
+                        <Ionicons name="copy-outline" size={14} color="rgba(0, 0, 0, 0.5)" />
+                      </Pressable>
+                      <Pressable style={styles.blockActionCircle} onPress={() => handlePlayTTS(text, false)}>
+                        <Ionicons name="volume-medium-outline" size={15} color="rgba(0, 0, 0, 0.5)" />
+                      </Pressable>
+                    </View>
+                  </View>
+                  <Text style={styles.dictatedText}>{text}</Text>
+                </View>
+
+                {/* Translation Divider */}
+                {translatedText && translatedText !== text ? (
+                  <>
+                    <View style={styles.divider} />
+
+                    {/* Translated Text Block */}
+                    <View style={styles.textBlock}>
+                      <View style={styles.textBlockHeader}>
+                        <Text style={[styles.textBlockTitle, { color: colors.accentBlue }]}>
+                          TRANSLATION ({getLanguageName(targetLangCode).toUpperCase()})
+                        </Text>
+                        <View style={styles.textBlockActions}>
+                          <Pressable style={styles.blockActionCircle} onPress={() => handleCopyText(translatedText)}>
+                            <Ionicons name="copy-outline" size={14} color={colors.accentBlue} />
+                          </Pressable>
+                          <Pressable style={styles.blockActionCircle} onPress={() => handlePlayTTS(translatedText, true)}>
+                            <Ionicons name="volume-medium-outline" size={15} color={colors.accentBlue} />
+                          </Pressable>
+                        </View>
+                      </View>
+                      <Text style={[styles.dictatedText, { color: '#2D3748' }]}>{translatedText}</Text>
+                    </View>
+                  </>
+                ) : null}
+
+              </View>
             ) : (
               <Text style={styles.placeholderText}>
-                Speak in Tamil, English, Hindi, Kannada, Telugu, Malayalam, Japanese, Spanish, or any other majority language. 
-                {"\n\n"}YSnap will auto-verify the voice, transcribe the text instantly, and log it in its original language.
+                Speak in Tamil, Hindi, Spanish, French, Chinese, Arabic, Portuguese, English, or any other majority language.
+                {"\n\n"}YSnap will auto-verify the voice, transcribe the text, and instantly translate it to your selected target language ({getLanguageName(targetLangCode)}).
               </Text>
             )}
           </ScrollView>
 
-          {/* Editor Action Buttons */}
+          {/* Editor Action Buttons (Universal Share / Clear) */}
           {text ? (
             <View style={styles.boardActionsRow}>
-              <Pressable style={styles.boardActionBtn} onPress={handleCopyText}>
-                <Ionicons name="copy-outline" size={18} color="#FFFFFF" />
-                <Text style={styles.boardActionTxt}>Copy</Text>
-              </Pressable>
-
               <Pressable style={styles.boardActionBtn} onPress={handleShareText}>
-                <Ionicons name="share-outline" size={18} color="#FFFFFF" />
-                <Text style={styles.boardActionTxt}>Share</Text>
+                <Ionicons name="share-outline" size={18} color="#1A1A1C" />
+                <Text style={styles.boardActionTxt}>Share Turn</Text>
               </Pressable>
 
-              <Pressable style={styles.boardActionBtn} onPress={handlePlayTTS}>
-                <Ionicons name="volume-medium-outline" size={18} color="#FFFFFF" />
-                <Text style={styles.boardActionTxt}>Speak</Text>
-              </Pressable>
-
-              <Pressable style={[styles.boardActionBtn, { backgroundColor: 'rgba(239, 83, 80, 0.2)' }]} onPress={handleClearText}>
+              <Pressable style={[styles.boardActionBtn, { backgroundColor: 'rgba(239, 83, 80, 0.12)' }]} onPress={handleClearText}>
                 <Ionicons name="trash-outline" size={18} color={colors.error} />
-                <Text style={[styles.boardActionTxt, { color: colors.error }]}>Clear</Text>
+                <Text style={[styles.boardActionTxt, { color: colors.error }]}>Clear Board</Text>
               </Pressable>
             </View>
           ) : null}
@@ -480,17 +588,17 @@ export default function ConverseTab() {
                 value={vadEnabled}
                 onValueChange={setVadEnabled}
                 thumbColor={colors.accentBlue}
-                trackColor={{ true: colors.accentBlue, false: 'rgba(255, 255, 255, 0.1)' }}
+                trackColor={{ true: colors.accentBlue, false: 'rgba(0, 0, 0, 0.1)' }}
                 style={{ transform: [{ scaleX: 0.8 }, { scaleY: 0.8 }] }}
               />
             </View>
             <View style={styles.toggleRow}>
-              <Text style={styles.toggleLabel}>Voice Readback</Text>
+              <Text style={styles.toggleLabel}>Auto Playback</Text>
               <Switch
                 value={autoPlay}
                 onValueChange={setAutoPlay}
                 thumbColor={colors.accentBlue}
-                trackColor={{ true: colors.accentBlue, false: 'rgba(255, 255, 255, 0.1)' }}
+                trackColor={{ true: colors.accentBlue, false: 'rgba(0, 0, 0, 0.1)' }}
                 style={{ transform: [{ scaleX: 0.8 }, { scaleY: 0.8 }] }}
               />
             </View>
@@ -532,10 +640,41 @@ export default function ConverseTab() {
 
           {/* Right helper info */}
           <View style={styles.infoCol}>
-            <Ionicons name="mic-circle" size={32} color={isRecording ? colors.accentBlue : 'rgba(255, 255, 255, 0.2)'} />
+            <Ionicons name="mic-circle" size={32} color={isRecording ? colors.accentBlue : 'rgba(0, 0, 0, 0.2)'} />
           </View>
         </View>
       </ScrollView>
+
+      {/* Target Language Picker Modal */}
+      <Modal
+        visible={showLangPicker}
+        animationType="slide"
+        transparent={true}
+        onRequestClose={() => setShowLangPicker(false)}
+      >
+        <View style={styles.modalOverlay}>
+          <View style={styles.modalContainer}>
+            <View style={styles.modalHeader}>
+              <Text style={styles.modalTitle}>Choose Target Language</Text>
+              <Pressable onPress={() => setShowLangPicker(false)} style={styles.modalCloseBtn}>
+                <Ionicons name="close" size={24} color="#1A1A1C" />
+              </Pressable>
+            </View>
+            <ScrollView style={styles.languagesList} showsVerticalScrollIndicator={false}>
+              {languages.map((lang) => (
+                <Pressable
+                  key={lang.code}
+                  style={styles.languageItem}
+                  onPress={() => selectTargetLanguage(lang.code)}
+                >
+                  <Text style={styles.languageItemText}>{lang.name}</Text>
+                  <Text style={styles.languageItemNative}>{lang.nativeName}</Text>
+                </Pressable>
+              ))}
+            </ScrollView>
+          </View>
+        </View>
+      </Modal>
 
       {/* History Log Sheet Modal */}
       <Modal
@@ -546,16 +685,16 @@ export default function ConverseTab() {
       >
         <SafeAreaView style={styles.historyContainer}>
           <View style={styles.historyHeader}>
-            <Text style={styles.historyTitle}>Transcription History</Text>
+            <Text style={styles.historyTitle}>Translation History</Text>
             <Pressable onPress={() => setShowHistory(false)} style={styles.closeBtn}>
-              <Ionicons name="close" size={24} color="#FFFFFF" />
+              <Ionicons name="close" size={24} color="#1A1A1C" />
             </Pressable>
           </View>
 
           {turns.length === 0 ? (
             <View style={styles.emptyHistory}>
-              <Ionicons name="document-text-outline" size={64} color="rgba(255, 255, 255, 0.2)" />
-              <Text style={styles.emptyHistoryTxt}>No voice transcriptions logged yet.</Text>
+              <Ionicons name="document-text-outline" size={64} color="rgba(0, 0, 0, 0.2)" />
+              <Text style={styles.emptyHistoryTxt}>No translations logged yet.</Text>
             </View>
           ) : (
             <ScrollView contentContainerStyle={styles.historyList} showsVerticalScrollIndicator={false}>
@@ -563,14 +702,25 @@ export default function ConverseTab() {
                 <View key={turn.id || index} style={styles.historyCard}>
                   <View style={styles.historyCardHeader}>
                     <View style={styles.langPill}>
-                      <Text style={styles.langPillTxt}>{turn.detectedLanguageName}</Text>
+                      <Text style={styles.langPillTxt}>
+                        {turn.detectedLanguageName} → {turn.targetLanguageName || getLanguageName(turn.targetLanguage)}
+                      </Text>
                     </View>
                     <Text style={styles.historyTime}>
                       {new Date(turn.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
                     </Text>
                   </View>
 
-                  <Text style={styles.historyText}>{turn.text}</Text>
+                  <View style={styles.historyTextContainer}>
+                    <Text style={styles.historyTextOriginal}>{turn.text}</Text>
+                    
+                    {turn.translatedText && turn.translatedText !== turn.text ? (
+                      <>
+                        <View style={styles.historyDivider} />
+                        <Text style={styles.historyTextTranslated}>{turn.translatedText}</Text>
+                      </>
+                    ) : null}
+                  </View>
 
                   <View style={styles.historyActions}>
                     {turn.originalAudioUrl && (
@@ -581,7 +731,7 @@ export default function ConverseTab() {
                           player.play();
                         }}
                       >
-                        <Ionicons name="play-outline" size={14} color="#FFFFFF" style={{ marginRight: 4 }} />
+                        <Ionicons name="play-outline" size={14} color="#1A1A1C" style={{ marginRight: 4 }} />
                         <Text style={styles.actionTxt}>Voice</Text>
                       </Pressable>
                     )}
@@ -604,25 +754,29 @@ export default function ConverseTab() {
                     <Pressable 
                       style={styles.actionCircle}
                       onPress={async () => {
-                        Clipboard.setString(turn.text);
+                        Clipboard.setString(turn.translatedText || turn.text);
                         Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
                         Alert.alert('Copied', 'Text copied to clipboard.');
                       }}
                     >
-                      <Ionicons name="copy-outline" size={16} color="rgba(255, 255, 255, 0.6)" />
+                      <Ionicons name="copy-outline" size={16} color="rgba(0, 0, 0, 0.5)" />
                     </Pressable>
 
                     <Pressable 
                       style={styles.actionCircle}
                       onPress={async () => {
                         try {
-                          await Share.share({ message: turn.text });
+                          await Share.share({ 
+                            message: turn.translatedText && turn.translatedText !== turn.text
+                              ? `${turn.text} => ${turn.translatedText}`
+                              : turn.text
+                          });
                         } catch (e) {
                           console.error(e);
                         }
                       }}
                     >
-                      <Ionicons name="share-social-outline" size={16} color="rgba(255, 255, 255, 0.6)" />
+                      <Ionicons name="share-social-outline" size={16} color="rgba(0, 0, 0, 0.5)" />
                     </Pressable>
                   </View>
                 </View>
@@ -638,7 +792,7 @@ export default function ConverseTab() {
 const styles = StyleSheet.create({
   container: {
     flex: 1,
-    backgroundColor: '#121214',
+    backgroundColor: '#F8F9FA',
   },
   header: {
     flexDirection: 'row',
@@ -647,15 +801,15 @@ const styles = StyleSheet.create({
     paddingHorizontal: spacing.md,
     paddingVertical: spacing.sm,
     borderBottomWidth: 1,
-    borderBottomColor: '#202024',
-    backgroundColor: '#121214',
+    borderBottomColor: '#ECEEF1',
+    backgroundColor: '#FFFFFF',
   },
   headerBtn: {
     padding: 8,
   },
   headerTitle: {
     ...typography.bodyMedium,
-    color: '#FFFFFF',
+    color: '#1A1A1C',
     fontWeight: '800',
     letterSpacing: 1.5,
     textTransform: 'uppercase',
@@ -664,35 +818,70 @@ const styles = StyleSheet.create({
     flexGrow: 1,
     paddingHorizontal: spacing.md,
     paddingTop: spacing.md,
-    paddingBottom: spacing.xl,
+    paddingBottom: 110,
   },
   dictationBoard: {
     flex: 1,
-    minHeight: 350,
-    backgroundColor: '#1C1C1E',
+    minHeight: 380,
+    backgroundColor: '#FFFFFF',
     borderRadius: 24,
     borderWidth: 1,
-    borderColor: '#2C2C2E',
+    borderColor: '#E4E7EC',
     padding: spacing.md,
     marginBottom: spacing.md,
+    shadowColor: '#000000',
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.05,
+    shadowRadius: 8,
+    elevation: 2,
   },
-  detectedBadgeRow: {
+  boardConfigRow: {
     flexDirection: 'row',
     alignItems: 'center',
+    justifyContent: 'space-between',
     borderBottomWidth: 1,
-    borderBottomColor: '#2C2C2E',
+    borderBottomColor: '#E4E7EC',
     paddingBottom: spacing.sm,
     marginBottom: spacing.sm,
   },
-  detectedBadgeText: {
-    fontSize: 12,
-    fontWeight: '600',
-    color: '#FFFFFF',
+  detectedBadge: {
+    flexDirection: 'row',
+    alignItems: 'center',
   },
-  detectedBadgePlaceholder: {
-    fontSize: 12,
+  detectedLabelTxt: {
+    fontSize: 11,
+    fontWeight: '600',
+    color: 'rgba(0, 0, 0, 0.6)',
+  },
+  detectedPlaceholderTxt: {
+    fontSize: 11,
     fontWeight: '500',
-    color: 'rgba(255, 255, 255, 0.4)',
+    color: 'rgba(0, 0, 0, 0.4)',
+  },
+  targetLangSelector: {
+    flexDirection: 'row',
+    alignItems: 'center',
+  },
+  toLabel: {
+    fontSize: 11,
+    color: 'rgba(0, 0, 0, 0.4)',
+    marginRight: 4,
+    fontWeight: '600',
+  },
+  langSelectorBtn: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: 'rgba(0, 0, 0, 0.04)',
+    borderRadius: 8,
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+    borderWidth: 1,
+    borderColor: 'rgba(0, 0, 0, 0.08)',
+  },
+  langSelectorBtnTxt: {
+    fontSize: 11,
+    fontWeight: '700',
+    color: '#1A1A1C',
   },
   textContainer: {
     flex: 1,
@@ -701,16 +890,54 @@ const styles = StyleSheet.create({
   textScrollContent: {
     flexGrow: 1,
   },
+  dualTextContainer: {
+    flex: 1,
+    gap: 16,
+  },
+  textBlock: {
+    flex: 1,
+  },
+  textBlockHeader: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginBottom: 6,
+  },
+  textBlockTitle: {
+    fontSize: 10,
+    fontWeight: '800',
+    color: 'rgba(0, 0, 0, 0.4)',
+    letterSpacing: 1,
+  },
+  textBlockActions: {
+    flexDirection: 'row',
+    gap: 8,
+  },
+  blockActionCircle: {
+    width: 26,
+    height: 26,
+    borderRadius: 13,
+    backgroundColor: 'rgba(0, 0, 0, 0.04)',
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderWidth: 1,
+    borderColor: 'rgba(0, 0, 0, 0.08)',
+  },
   dictatedText: {
-    fontSize: 20,
-    lineHeight: 28,
-    color: '#FFFFFF',
+    fontSize: 18,
+    lineHeight: 26,
+    color: '#1A1A1C',
     fontWeight: '500',
   },
+  divider: {
+    height: 1,
+    backgroundColor: '#E4E7EC',
+    marginVertical: 4,
+  },
   placeholderText: {
-    fontSize: 16,
-    lineHeight: 24,
-    color: 'rgba(255, 255, 255, 0.35)',
+    fontSize: 15,
+    lineHeight: 22,
+    color: 'rgba(0, 0, 0, 0.4)',
     fontStyle: 'italic',
   },
   loadingContainer: {
@@ -720,8 +947,8 @@ const styles = StyleSheet.create({
     paddingVertical: spacing.xl,
   },
   loadingText: {
-    fontSize: 14,
-    color: 'rgba(255, 255, 255, 0.6)',
+    fontSize: 13,
+    color: 'rgba(0, 0, 0, 0.6)',
     marginTop: spacing.md,
   },
   boardActionsRow: {
@@ -729,7 +956,7 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'space-between',
     borderTopWidth: 1,
-    borderTopColor: '#2C2C2E',
+    borderTopColor: '#E4E7EC',
     paddingTop: spacing.md,
     marginTop: spacing.sm,
     gap: spacing.sm,
@@ -739,28 +966,33 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'center',
-    backgroundColor: 'rgba(255, 255, 255, 0.05)',
+    backgroundColor: 'rgba(0, 0, 0, 0.04)',
     borderRadius: 12,
     paddingVertical: 10,
     borderWidth: 1,
-    borderColor: 'rgba(255, 255, 255, 0.08)',
+    borderColor: 'rgba(0, 0, 0, 0.08)',
   },
   boardActionTxt: {
     fontSize: 12,
     fontWeight: '600',
-    color: '#FFFFFF',
+    color: '#1A1A1C',
     marginLeft: 6,
   },
   micControlCard: {
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'space-between',
-    backgroundColor: '#1C1C1E',
+    backgroundColor: '#FFFFFF',
     borderRadius: 24,
     borderWidth: 1,
-    borderColor: '#2C2C2E',
+    borderColor: '#E4E7EC',
     padding: spacing.md,
     paddingVertical: 18,
+    shadowColor: '#000000',
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.05,
+    shadowRadius: 8,
+    elevation: 2,
   },
   micSettings: {
     flex: 1.2,
@@ -775,7 +1007,7 @@ const styles = StyleSheet.create({
   toggleLabel: {
     fontSize: 11,
     fontWeight: '600',
-    color: 'rgba(255, 255, 255, 0.65)',
+    color: 'rgba(0, 0, 0, 0.7)',
   },
   micOrbContainer: {
     flex: 1.5,
@@ -785,7 +1017,7 @@ const styles = StyleSheet.create({
   timerWrapper: {
     position: 'absolute',
     top: -24,
-    backgroundColor: 'rgba(239, 83, 80, 0.15)',
+    backgroundColor: 'rgba(239, 83, 80, 0.12)',
     paddingHorizontal: 8,
     paddingVertical: 2,
     borderRadius: 8,
@@ -822,7 +1054,7 @@ const styles = StyleSheet.create({
   micStatusLabel: {
     fontSize: 9,
     fontWeight: '800',
-    color: 'rgba(255, 255, 255, 0.4)',
+    color: 'rgba(0, 0, 0, 0.4)',
     letterSpacing: 1,
     marginTop: 2,
   },
@@ -831,9 +1063,58 @@ const styles = StyleSheet.create({
     alignItems: 'flex-end',
     justifyContent: 'center',
   },
+  modalOverlay: {
+    flex: 1,
+    backgroundColor: 'rgba(0,0,0,0.5)',
+    justifyContent: 'flex-end',
+  },
+  modalContainer: {
+    backgroundColor: '#FFFFFF',
+    borderTopLeftRadius: 24,
+    borderTopRightRadius: 24,
+    padding: spacing.md,
+    maxHeight: '75%',
+  },
+  modalHeader: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    borderBottomWidth: 1,
+    borderBottomColor: '#E4E7EC',
+    paddingBottom: spacing.md,
+    marginBottom: spacing.md,
+  },
+  modalTitle: {
+    fontSize: 16,
+    fontWeight: '800',
+    color: '#1A1A1C',
+  },
+  modalCloseBtn: {
+    padding: 4,
+  },
+  languagesList: {
+    marginBottom: spacing.xl,
+  },
+  languageItem: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    paddingVertical: 14,
+    borderBottomWidth: 1,
+    borderBottomColor: '#E4E7EC',
+  },
+  languageItemText: {
+    fontSize: 15,
+    color: '#1A1A1C',
+    fontWeight: '600',
+  },
+  languageItemNative: {
+    fontSize: 13,
+    color: 'rgba(0, 0, 0, 0.4)',
+  },
   historyContainer: {
     flex: 1,
-    backgroundColor: '#121214',
+    backgroundColor: '#F8F9FA',
   },
   historyHeader: {
     flexDirection: 'row',
@@ -842,12 +1123,13 @@ const styles = StyleSheet.create({
     paddingHorizontal: spacing.md,
     paddingVertical: spacing.md,
     borderBottomWidth: 1,
-    borderBottomColor: '#202024',
+    borderBottomColor: '#ECEEF1',
+    backgroundColor: '#FFFFFF',
   },
   historyTitle: {
     fontSize: 18,
     fontWeight: '800',
-    color: '#FFFFFF',
+    color: '#1A1A1C',
   },
   closeBtn: {
     padding: 6,
@@ -860,7 +1142,7 @@ const styles = StyleSheet.create({
   },
   emptyHistoryTxt: {
     fontSize: 15,
-    color: 'rgba(255, 255, 255, 0.4)',
+    color: 'rgba(0, 0, 0, 0.4)',
     textAlign: 'center',
     marginTop: spacing.md,
   },
@@ -869,11 +1151,16 @@ const styles = StyleSheet.create({
     gap: spacing.md,
   },
   historyCard: {
-    backgroundColor: '#1C1C1E',
+    backgroundColor: '#FFFFFF',
     borderRadius: 16,
     borderWidth: 1,
-    borderColor: '#2C2C2E',
+    borderColor: '#E4E7EC',
     padding: spacing.md,
+    shadowColor: '#000000',
+    shadowOffset: { width: 0, height: 1 },
+    shadowOpacity: 0.03,
+    shadowRadius: 4,
+    elevation: 1,
   },
   historyCardHeader: {
     flexDirection: 'row',
@@ -882,7 +1169,7 @@ const styles = StyleSheet.create({
     marginBottom: spacing.sm,
   },
   langPill: {
-    backgroundColor: 'rgba(92, 107, 192, 0.2)',
+    backgroundColor: 'rgba(92, 107, 192, 0.1)',
     paddingHorizontal: 8,
     paddingVertical: 2,
     borderRadius: 8,
@@ -890,19 +1177,33 @@ const styles = StyleSheet.create({
   langPillTxt: {
     fontSize: 10,
     fontWeight: '700',
-    color: '#8F9BFF',
+    color: '#5C6BC0',
     textTransform: 'uppercase',
   },
   historyTime: {
     fontSize: 11,
-    color: 'rgba(255, 255, 255, 0.45)',
+    color: 'rgba(0, 0, 0, 0.4)',
   },
-  historyText: {
+  historyTextContainer: {
+    marginBottom: spacing.md,
+    gap: 8,
+  },
+  historyTextOriginal: {
+    fontSize: 15,
+    lineHeight: 22,
+    color: 'rgba(0, 0, 0, 0.6)',
+    fontWeight: '400',
+  },
+  historyTextTranslated: {
     fontSize: 16,
     lineHeight: 24,
-    color: '#FFFFFF',
-    fontWeight: '400',
-    marginBottom: spacing.md,
+    color: '#1A1A1C',
+    fontWeight: '500',
+  },
+  historyDivider: {
+    height: 1,
+    backgroundColor: '#E4E7EC',
+    marginVertical: 2,
   },
   historyActions: {
     flexDirection: 'row',
@@ -912,26 +1213,26 @@ const styles = StyleSheet.create({
   actionBtn: {
     flexDirection: 'row',
     alignItems: 'center',
-    backgroundColor: 'rgba(255, 255, 255, 0.05)',
+    backgroundColor: 'rgba(0, 0, 0, 0.04)',
     borderRadius: 8,
     paddingHorizontal: 10,
     paddingVertical: 6,
     borderWidth: 1,
-    borderColor: 'rgba(255, 255, 255, 0.08)',
+    borderColor: 'rgba(0, 0, 0, 0.08)',
   },
   actionTxt: {
     fontSize: 11,
     fontWeight: '600',
-    color: '#FFFFFF',
+    color: '#1A1A1C',
   },
   actionCircle: {
     width: 32,
     height: 32,
     borderRadius: 16,
-    backgroundColor: 'rgba(255, 255, 255, 0.05)',
+    backgroundColor: 'rgba(0, 0, 0, 0.04)',
     alignItems: 'center',
     justifyContent: 'center',
     borderWidth: 1,
-    borderColor: 'rgba(255, 255, 255, 0.08)',
+    borderColor: 'rgba(0, 0, 0, 0.08)',
   },
 });

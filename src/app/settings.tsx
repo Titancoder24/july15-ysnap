@@ -30,6 +30,56 @@ export default function SettingsScreen() {
   const { user } = useAuth();
   const queryClient = useQueryClient();
 
+  // Fetch Daily Nutrition Goals
+  const { data: dailyGoals } = useQuery({
+    queryKey: ['dailyNutritionGoals', user?.id],
+    queryFn: async () => {
+      if (!user?.id) return null;
+      const { data, error } = await supabase
+        .from('daily_nutrition_goals')
+        .select('*')
+        .eq('user_id', user.id)
+        .maybeSingle();
+
+      if (!data) {
+        const defaultGoal = {
+          user_id: user.id,
+          recommended_calories: 2000,
+          recommended_protein: 130.0,
+          recommended_carbs: 250.0,
+          recommended_fat: 70.0,
+        };
+        const { data: inserted } = await supabase
+          .from('daily_nutrition_goals')
+          .insert(defaultGoal)
+          .select()
+          .single();
+        return inserted;
+      }
+      return data;
+    },
+    enabled: !!user?.id,
+  });
+
+  // Mutate Daily Goals
+  const updateDailyGoalsMutation = useMutation({
+    mutationFn: async (updatedFields: any) => {
+      if (!user?.id) return;
+      const { error } = await supabase
+        .from('daily_nutrition_goals')
+        .update(updatedFields)
+        .eq('user_id', user.id);
+      if (error) throw error;
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['dailyNutritionGoals', user?.id] });
+      Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+    },
+    onError: (err) => {
+      Alert.alert('Error', err.message);
+    }
+  });
+
   // Fetch User Preferences
   const { data: preferences, isLoading } = useQuery<any>({
     queryKey: ['preferences', user?.id],
@@ -291,37 +341,6 @@ export default function SettingsScreen() {
           )}
         </View>
 
-        {/* Theme selection */}
-        <View style={styles.section}>
-          <Text style={styles.sectionTitle}>Appearance Theme</Text>
-          <View style={styles.themeGroup}>
-            {[
-              { id: 'light', name: 'Light', icon: 'sunny-outline' },
-              { id: 'dark', name: 'Dark', icon: 'moon-outline' },
-              { id: 'system', name: 'System', icon: 'phone-portrait-outline' },
-            ].map((t) => {
-              const isSelected = preferences?.theme === t.id;
-              return (
-                <Pressable
-                  key={t.id}
-                  style={[styles.themeBtn, isSelected && styles.themeBtnActive]}
-                  onPress={() => handleSetTheme(t.id)}
-                >
-                  <Ionicons 
-                    name={t.icon as any} 
-                    size={20} 
-                    color={isSelected ? colors.textInverse : colors.textPrimary} 
-                    style={{ marginBottom: 6 }}
-                  />
-                  <Text style={[styles.themeBtnText, isSelected && styles.themeBtnTextActive]}>
-                    {t.name}
-                  </Text>
-                </Pressable>
-              );
-            })}
-          </View>
-        </View>
-
         {/* Data retention policies */}
         <View style={styles.section}>
           <Text style={styles.sectionTitle}>Data Retention & Sync</Text>
@@ -347,6 +366,122 @@ export default function SettingsScreen() {
               thumbColor={colors.primary}
               trackColor={{ true: colors.primary, false: colors.borderStrong }}
             />
+          </View>
+        </View>
+
+        {/* Daily Goal Impact (Nutritional Targets) Section */}
+        <View style={styles.section}>
+          <Text style={styles.sectionTitle}>Daily Goal Impact Settings</Text>
+          <Text style={styles.sectionSubtitle}>Set your daily recommended nutrition limits for camera food analysis scans.</Text>
+          
+          <View style={styles.nutrientCard}>
+            <View style={styles.nutrientAdjustRow}>
+              <View style={styles.nutrientTextCol}>
+                <Text style={styles.nutrientLabel}>Calories Goal</Text>
+                <Text style={styles.nutrientValue}>{dailyGoals?.recommended_calories ?? 2000} kcal</Text>
+              </View>
+              <View style={styles.adjustBtns}>
+                <Pressable 
+                  style={styles.adjustBtn} 
+                  onPress={() => {
+                    const current = dailyGoals?.recommended_calories ?? 2000;
+                    updateDailyGoalsMutation.mutate({ recommended_calories: Math.max(500, current - 100) });
+                  }}
+                >
+                  <Ionicons name="remove" size={20} color={colors.textPrimary} />
+                </Pressable>
+                <Pressable 
+                  style={styles.adjustBtn} 
+                  onPress={() => {
+                    const current = dailyGoals?.recommended_calories ?? 2000;
+                    updateDailyGoalsMutation.mutate({ recommended_calories: Math.min(10000, current + 100) });
+                  }}
+                >
+                  <Ionicons name="add" size={20} color={colors.textPrimary} />
+                </Pressable>
+              </View>
+            </View>
+
+            <View style={styles.nutrientAdjustRow}>
+              <View style={styles.nutrientTextCol}>
+                <Text style={styles.nutrientLabel}>Protein Goal</Text>
+                <Text style={styles.nutrientValue}>{dailyGoals?.recommended_protein ?? 130}g</Text>
+              </View>
+              <View style={styles.adjustBtns}>
+                <Pressable 
+                  style={styles.adjustBtn} 
+                  onPress={() => {
+                    const current = dailyGoals?.recommended_protein ?? 130;
+                    updateDailyGoalsMutation.mutate({ recommended_protein: Math.max(10, current - 5) });
+                  }}
+                >
+                  <Ionicons name="remove" size={20} color={colors.textPrimary} />
+                </Pressable>
+                <Pressable 
+                  style={styles.adjustBtn} 
+                  onPress={() => {
+                    const current = dailyGoals?.recommended_protein ?? 130;
+                    updateDailyGoalsMutation.mutate({ recommended_protein: Math.min(500, current + 5) });
+                  }}
+                >
+                  <Ionicons name="add" size={20} color={colors.textPrimary} />
+                </Pressable>
+              </View>
+            </View>
+
+            <View style={styles.nutrientAdjustRow}>
+              <View style={styles.nutrientTextCol}>
+                <Text style={styles.nutrientLabel}>Carbohydrates Goal</Text>
+                <Text style={styles.nutrientValue}>{dailyGoals?.recommended_carbs ?? 250}g</Text>
+              </View>
+              <View style={styles.adjustBtns}>
+                <Pressable 
+                  style={styles.adjustBtn} 
+                  onPress={() => {
+                    const current = dailyGoals?.recommended_carbs ?? 250;
+                    updateDailyGoalsMutation.mutate({ recommended_carbs: Math.max(10, current - 10) });
+                  }}
+                >
+                  <Ionicons name="remove" size={20} color={colors.textPrimary} />
+                </Pressable>
+                <Pressable 
+                  style={styles.adjustBtn} 
+                  onPress={() => {
+                    const current = dailyGoals?.recommended_carbs ?? 250;
+                    updateDailyGoalsMutation.mutate({ recommended_carbs: Math.min(1000, current + 10) });
+                  }}
+                >
+                  <Ionicons name="add" size={20} color={colors.textPrimary} />
+                </Pressable>
+              </View>
+            </View>
+
+            <View style={styles.nutrientAdjustRow}>
+              <View style={styles.nutrientTextCol}>
+                <Text style={styles.nutrientLabel}>Fats Goal</Text>
+                <Text style={styles.nutrientValue}>{dailyGoals?.recommended_fat ?? 70}g</Text>
+              </View>
+              <View style={styles.adjustBtns}>
+                <Pressable 
+                  style={styles.adjustBtn} 
+                  onPress={() => {
+                    const current = dailyGoals?.recommended_fat ?? 70;
+                    updateDailyGoalsMutation.mutate({ recommended_fat: Math.max(5, current - 5) });
+                  }}
+                >
+                  <Ionicons name="remove" size={20} color={colors.textPrimary} />
+                </Pressable>
+                <Pressable 
+                  style={styles.adjustBtn} 
+                  onPress={() => {
+                    const current = dailyGoals?.recommended_fat ?? 70;
+                    updateDailyGoalsMutation.mutate({ recommended_fat: Math.min(300, current + 5) });
+                  }}
+                >
+                  <Ionicons name="add" size={20} color={colors.textPrimary} />
+                </Pressable>
+              </View>
+            </View>
           </View>
         </View>
 
@@ -617,5 +752,54 @@ const styles = StyleSheet.create({
     ...typography.micro,
     color: colors.textInverse,
     fontWeight: '600',
+  },
+  sectionSubtitle: {
+    ...typography.caption,
+    color: colors.textMuted,
+    marginBottom: 16,
+    lineHeight: 16,
+  },
+  nutrientCard: {
+    backgroundColor: '#fff',
+    borderRadius: 16,
+    padding: 16,
+    borderWidth: 1,
+    borderColor: colors.border,
+  },
+  nutrientAdjustRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    paddingVertical: 12,
+    borderBottomWidth: 1,
+    borderBottomColor: '#f3f4f6',
+  },
+  nutrientTextCol: {
+    flex: 1,
+  },
+  nutrientLabel: {
+    fontSize: 14,
+    fontWeight: '600',
+    color: colors.textPrimary,
+  },
+  nutrientValue: {
+    fontSize: 12,
+    color: colors.textMuted,
+    marginTop: 2,
+  },
+  adjustBtns: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+  },
+  adjustBtn: {
+    backgroundColor: colors.surfaceSoft,
+    borderWidth: 1,
+    borderColor: colors.border,
+    borderRadius: 10,
+    width: 36,
+    height: 36,
+    alignItems: 'center',
+    justifyContent: 'center',
   },
 });

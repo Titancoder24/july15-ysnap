@@ -15,7 +15,7 @@ import * as Haptics from 'expo-haptics';
 import { useRouter } from 'expo-router';
 import { useQuery } from '@tanstack/react-query';
 import { Ionicons } from '@expo/vector-icons';
-import { useAudioPlayer, RecordingPresets, AudioModule } from 'expo-audio';
+import { useAudioPlayer, useAudioPlayerStatus, RecordingPresets, AudioModule } from 'expo-audio';
 import { useAppAudioRecorder } from '../utils/audioRecorder';
 import * as FileSystem from 'expo-file-system/legacy';
 import * as Sharing from 'expo-sharing';
@@ -65,6 +65,7 @@ export default function VoiceChangerScreen() {
   // Expo Audio SDK 57 recorder & player hooks
   const recorder = useAppAudioRecorder();
   const player = useAudioPlayer(outputAudioUrl || '');
+  const status = useAudioPlayerStatus(player);
 
   // Fetch cloned voice profiles
   const { data: clonedVoices = [] } = useQuery<any[]>({
@@ -106,10 +107,13 @@ export default function VoiceChangerScreen() {
   }, []);
 
   useEffect(() => {
-    if (isPlayingOutput && !player.playing && player.currentTime >= player.duration - 0.2) {
+    const isFinished = status.duration > 0 
+      ? status.currentTime >= status.duration - 0.2 
+      : false;
+    if (isPlayingOutput && !status.playing && (isFinished || isNaN(status.duration) || status.duration === 0)) {
       setIsPlayingOutput(false);
     }
-  }, [player.playing, player.currentTime]);
+  }, [status.playing, status.currentTime, status.duration]);
 
   const handleToggleRecord = async () => {
     Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
@@ -138,10 +142,12 @@ export default function VoiceChangerScreen() {
       Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
     } else {
       // Start
-      const permission = await AudioModule.requestRecordingPermissionsAsync();
-      if (!permission.granted) {
-        Alert.alert('Microphone Access', 'Microphone permissions are required for voice changer.');
-        return;
+      if (Platform.OS !== 'web') {
+        const permission = await AudioModule.requestRecordingPermissionsAsync();
+        if (!permission.granted) {
+          Alert.alert('Microphone Access', 'Microphone permissions are required for voice changer.');
+          return;
+        }
       }
 
       setIsRecording(true);

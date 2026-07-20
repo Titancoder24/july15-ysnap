@@ -29,8 +29,11 @@ Deno.serve(async (req) => {
     const userId = await verifyUser(req);
     checkRateLimit(userId, 20, 60_000);
 
-    const apiKey = await getSecret("ELEVENLABS_API_KEY");
-    const apiBaseUrl = await getSecret("ELEVENLABS_API_BASE_URL").catch(() => "https://api.elevenlabs.io");
+    const [apiKey, apiBaseUrl, openRouterApiKey] = await Promise.all([
+      getSecret("ELEVENLABS_API_KEY"),
+      getSecret("ELEVENLABS_API_BASE_URL").catch(() => "https://api.elevenlabs.io"),
+      getSecret("OPENROUTER_API_KEY"),
+    ]);
 
     if (!(req.headers.get("content-type") ?? "").includes("multipart/form-data")) {
       return formatError("Invalid Content-Type. Must be multipart/form-data");
@@ -57,20 +60,21 @@ Deno.serve(async (req) => {
       use_speaker_boost: true,
     }));
 
-    const transcriptForm = new FormData();
-    transcriptForm.append("file", file, file.name || "input-audio");
-    transcriptForm.append("model_id", "scribe_v2");
-    transcriptForm.append("tag_audio_events", "false");
+    // Use OpenRouter Whisper transcription (sub-1s latency) instead of slow ElevenLabs speech-to-text
+    const sttFormData = new FormData();
+    sttFormData.append("file", file, file.name || "input-audio");
+    sttFormData.append("model", "openai/whisper-large-v3-turbo");
+    sttFormData.append("response_format", "verbose_json");
 
     const [voiceResponse, transcriptResponse] = await Promise.all([
       fetch(
         `${apiBaseUrl}/v1/speech-to-speech/${encodeURIComponent(voiceId)}?output_format=mp3_44100_128`,
         { method: "POST", headers: { "xi-api-key": apiKey }, body: voiceForm },
       ),
-      fetch(`${apiBaseUrl}/v1/speech-to-text`, {
+      fetch("https://openrouter.ai/api/v1/audio/transcriptions", {
         method: "POST",
-        headers: { "xi-api-key": apiKey },
-        body: transcriptForm,
+        headers: { "Authorization": `Bearer ${openRouterApiKey}` },
+        body: sttFormData,
       }),
     ]);
 
@@ -80,7 +84,7 @@ Deno.serve(async (req) => {
 
     const transcript = transcriptResponse.ok ? await transcriptResponse.json() : null;
     const sourceText = String(transcript?.text || "Voice conversion").trim();
-    const languageCode = String(transcript?.language_code || "und");
+    const languageCode = String(transcript?.language || "und");
     const audioBuffer = await voiceResponse.arrayBuffer();
 
     await logUsageEvent(userId, "voice_change", file.size, "bytes", {
@@ -177,11 +181,24 @@ Deno.serve(async (req) => {
     ]);
     if (mediaError) throw new Error(`Failed to save media records: ${mediaError.message}`);
 
+    // Query sequence number dynamically to support multiple turns in same session
+    let sequenceNumber = 1;
+    const { data: lastItem } = await supabase
+      .from("translation_items")
+      .select("sequence_number")
+      .eq("session_id", sessionId)
+      .order("sequence_number", { ascending: false })
+      .limit(1)
+      .maybeSingle();
+    if (lastItem) {
+      sequenceNumber = lastItem.sequence_number + 1;
+    }
+
     const { error: itemError } = await supabase.from("translation_items").insert({
       session_id: sessionId,
       user_id: userId,
       speaker_id: "user",
-      sequence_number: 1,
+      sequence_number: sequenceNumber,
       source_text: sourceText,
       translated_text: sourceText,
       detected_language: languageCode,

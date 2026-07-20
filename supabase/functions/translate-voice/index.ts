@@ -5,6 +5,7 @@ import {
   formatResponse,
   GEMINI_MODEL,
   generateTextResult,
+  generateMultimodalResult,
   handleCors,
   logUsageEvent,
   verifyUser,
@@ -16,10 +17,11 @@ const MAX_AUDIO_BYTES = 20 * 1024 * 1024;
 const MEDIA_BUCKET = "media";
 
 function audioExtension(file: File): string {
-  if (file.type.includes("webm")) return "webm";
-  if (file.type.includes("wav")) return "wav";
-  if (file.type.includes("mp4") || file.type.includes("m4a")) return "m4a";
-  if (file.type.includes("ogg")) return "ogg";
+  const mime = file?.type || "";
+  if (mime.includes("webm")) return "webm";
+  if (mime.includes("wav")) return "wav";
+  if (mime.includes("mp4") || mime.includes("m4a")) return "m4a";
+  if (mime.includes("ogg")) return "ogg";
   return "mp3";
 }
 
@@ -31,8 +33,11 @@ Deno.serve(async (req) => {
     const userId = await verifyUser(req);
     checkRateLimit(userId, 20, 60_000);
 
-    const elevenLabsApiKey = await getSecret("ELEVENLABS_API_KEY");
-    const elevenLabsApiBaseUrl = await getSecret("ELEVENLABS_API_BASE_URL").catch(() => "https://api.elevenlabs.io");
+    const [elevenLabsApiKey, elevenLabsApiBaseUrl, openRouterApiKey] = await Promise.all([
+      getSecret("ELEVENLABS_API_KEY"),
+      getSecret("ELEVENLABS_API_BASE_URL").catch(() => "https://api.elevenlabs.io"),
+      getSecret("OPENROUTER_API_KEY"),
+    ]);
 
     if (!(req.headers.get("content-type") ?? "").includes("multipart/form-data")) {
       return formatError("Invalid Content-Type. Must be multipart/form-data");
@@ -76,57 +81,7 @@ Deno.serve(async (req) => {
         console.log(`Auto-defaulting to user's cloned voice: ${customVoice.provider_voice_id}`);
         voiceId = customVoice.provider_voice_id;
       } else {
-        console.log("No cloned voice found. Dynamically cloning user's voice on-the-fly using input audio...");
-        try {
-          if (file.size > 50 * 1024) {
-            const outboundFormData = new FormData();
-            outboundFormData.append("name", `Auto Clone (${userId.slice(0, 5)})`);
-            outboundFormData.append("description", "Dynamically cloned during voice translation");
-            outboundFormData.append("files", file, "sample.mp3");
-            outboundFormData.append("remove_background_noise", "true");
-
-            const elevenLabsResponse = await fetch("https://api.elevenlabs.io/v1/voices/add", {
-              method: "POST",
-              headers: {
-                "xi-api-key": apiKey
-              },
-              body: outboundFormData
-            });
-
-            if (elevenLabsResponse.ok) {
-              const resData = await elevenLabsResponse.json();
-              const providerVoiceId = resData.voice_id;
-              console.log(`Successfully created dynamic voice clone: ${providerVoiceId}`);
-
-              // Save in voice_profiles
-              const { data: vp, error: vpError } = await supabase
-                .from("voice_profiles")
-                .insert({
-                  user_id: userId,
-                  provider: 'elevenlabs',
-                  display_name: 'Dynamic Auto-Clone',
-                  provider_voice_id: providerVoiceId,
-                  status: 'ready',
-                  is_cloned: true
-                })
-                .select()
-                .single();
-
-              if (!vpError && vp) {
-                voiceId = providerVoiceId;
-                // Update user preferences to default to this new voice ID
-                await supabase
-                  .from("user_preferences")
-                  .update({ selected_voice_id: providerVoiceId })
-                  .eq("user_id", userId);
-              }
-            } else {
-              console.warn(`ElevenLabs dynamic voice cloning returned status ${elevenLabsResponse.status}: ${await elevenLabsResponse.text()}`);
-            }
-          }
-        } catch (cloneErr) {
-          console.error("Failed to dynamically clone voice on the fly:", cloneErr);
-        }
+        console.log("No cloned voice found. Using default preset system voice (Rachel)...");
       }
     }
 
@@ -154,8 +109,8 @@ Deno.serve(async (req) => {
           status: sessionType === "conversation" ? "active" : "completed",
           metadata: {
             speech_provider: "elevenlabs",
-            stt_model: "scribe_v2",
-            tts_model: "eleven_v3",
+            stt_model: "whisper-large-v3-turbo",
+            tts_model: "eleven_multilingual_v2",
             translation_provider: "google",
             translation_model: GEMINI_MODEL,
             voice_id: voiceId,
@@ -193,25 +148,85 @@ Deno.serve(async (req) => {
       });
     if (inputUploadError) throw new Error(`Failed to save source audio: ${inputUploadError.message}`);
 
-    const sttFormData = new FormData();
-    sttFormData.append("file", file, file.name || `input.${extension}`);
-    sttFormData.append("model_id", "scribe_v2");
-    sttFormData.append("tag_audio_events", "false");
-    if (source !== "auto") sttFormData.append("language_code", source);
+    let sourceText = "";
+    let translatedText = "";
+    let detectedLanguage = "unknown";
+    let translationModel = "";
 
-    const sttResponse = await fetch(`${elevenLabsApiBaseUrl}/v1/speech-to-text`, {
-      method: "POST",
-      headers: { "xi-api-key": elevenLabsApiKey },
-      body: sttFormData,
-    });
-    if (!sttResponse.ok) {
-      throw new Error(`ElevenLabs transcription failed (${sttResponse.status}): ${await sttResponse.text()}`);
+    try {
+      console.log("Attempting direct multimodal audio translation with Gemini 3.5 Flash...");
+      const audioBuffer = await file.arrayBuffer();
+      const audioBytes = new Uint8Array(audioBuffer);
+      const mimeType = file.type || "audio/mpeg";
+
+      const prompt = `Transcribe the spoken audio and translate it into ${target}. 
+Return one valid JSON object with exactly these keys:
+- source_text (string): the exact transcription of the spoken words in the original language.
+- translated_text (string): the translation of that transcription into ${target}.
+- detected_language (string): the detected language code or name.`;
+
+      const systemInstruction = "You are a precise conversational speech-to-text translator. Return one valid JSON object with the keys source_text, translated_text, and detected_language. Do not add markdown or formatting.";
+
+      const generated = await generateMultimodalResult(
+        audioBytes,
+        mimeType,
+        prompt,
+        systemInstruction,
+        true
+      );
+
+      const parsed = safeParseAIJson<{
+        source_text: string;
+        translated_text: string;
+        detected_language?: string;
+      }>(generated.text, {
+        source_text: 'string',
+        translated_text: 'string',
+        detected_language: 'string'
+      });
+
+      sourceText = String(parsed.source_text || "").trim();
+      translatedText = String(parsed.translated_text || "").trim();
+      detectedLanguage = String(parsed.detected_language || "unknown");
+      translationModel = generated.model;
+      
+      console.log(`Multimodal speech translation success! Latency optimized. Source: "${sourceText}", Target: "${translatedText}"`);
+    } catch (multimodalError) {
+      console.warn("Direct multimodal audio translation failed, falling back to Whisper + Gemini text pipeline:", multimodalError);
+      
+      // Fallback: Use Whisper STT on OpenRouter
+      const sttFormData = new FormData();
+      sttFormData.append("file", file, file.name || `input.${extension}`);
+      sttFormData.append("model", "openai/whisper-large-v3-turbo");
+      sttFormData.append("response_format", "verbose_json");
+      if (source !== "auto") sttFormData.append("language", source);
+
+      const sttResponse = await fetch("https://openrouter.ai/api/v1/audio/transcriptions", {
+        method: "POST",
+        headers: { "Authorization": `Bearer ${openRouterApiKey}` },
+        body: sttFormData,
+      });
+      if (!sttResponse.ok) {
+        throw new Error(`Whisper transcription failed (${sttResponse.status}): ${await sttResponse.text()}`);
+      }
+
+      const sttResult = await sttResponse.json();
+      sourceText = String(sttResult.text || "").trim();
+      if (!sourceText) throw new Error("No speech was detected in the recording");
+      detectedLanguage = String(sttResult.language || source || "unknown");
+
+      const textPrompt = `Translate from ${source === "auto" ? detectedLanguage : source} to ${target}:\n\n${sourceText}`;
+      const systemInstruction = `You are a precise conversational translator. Return one valid JSON object with these keys: translated_text (string), detected_language (ISO language code). Translate naturally into ${target}. Do not add markdown.`;
+      
+      const generatedText = await generateTextResult(textPrompt, systemInstruction, true);
+      const parsedText = safeParseAIJson<{ translated_text: string }>(generatedText.text, { translated_text: 'string' });
+      
+      translatedText = String(parsedText.translated_text || generatedText.text).trim();
+      translationModel = generatedText.model;
     }
 
-    const sttResult = await sttResponse.json();
-    const sourceText = String(sttResult.text || "").trim();
     if (!sourceText) throw new Error("No speech was detected in the recording");
-    const detectedLanguage = String(sttResult.language_code || source || "unknown");
+    if (!translatedText) throw new Error("The translation provider returned an empty translation");
 
     await logUsageEvent(userId, "transcription", file.size, "bytes", {
       session_id: sessionId,
@@ -219,42 +234,15 @@ Deno.serve(async (req) => {
       text_length: sourceText.length,
     });
 
-    const systemInstruction = `You are a precise conversational translator. Return one valid JSON object with these keys: translated_text (string), detected_language (ISO language code), transliteration (string or null), alternatives (array of up to 3 strings), and context_notes (short string or null). Translate naturally into ${target}. Do not add markdown.`;
-    const generatedTranslation = await generateTextResult(
-      `Translate from ${source === "auto" ? detectedLanguage : source} to ${target}:\n\n${sourceText}`,
-      systemInstruction,
-      true,
-    );
-    const translatedRaw = generatedTranslation.text;
-
-    const translation = safeParseAIJson<{
-      translated_text: string;
-      detected_language?: string;
-      transliteration?: string | null;
-      alternatives?: string[];
-      context_notes?: string | null;
-    }>(translatedRaw, {
-      translated_text: 'string',
-      detected_language: 'string',
-      transliteration: 'string',
-      alternatives: 'array',
-      context_notes: 'string'
-    });
-
-    if (!translation.translated_text) {
-      translation.translated_text = translatedRaw.trim();
-    }
-    const translatedText = String(translation.translated_text || "").trim();
-    if (!translatedText) throw new Error("The translation provider returned an empty translation");
-
     await logUsageEvent(userId, "translation", sourceText.length, "characters", {
       session_id: sessionId,
       source_language: source,
       target_language: target,
       provider: "google",
-      model: generatedTranslation.model,
+      model: translationModel,
     });
 
+    // Use eleven_multilingual_v2 (Low-latency multilingual model) instead of slow eleven_v3
     const ttsResponse = await fetch(
       `${elevenLabsApiBaseUrl}/v1/text-to-speech/${encodeURIComponent(voiceId)}?output_format=mp3_44100_128`,
       {
@@ -262,7 +250,7 @@ Deno.serve(async (req) => {
         headers: { "Content-Type": "application/json", "xi-api-key": elevenLabsApiKey },
         body: JSON.stringify({
           text: translatedText,
-          model_id: "eleven_v3",
+          model_id: "eleven_multilingual_v2",
           voice_settings: {
             stability: 0.5,
             similarity_boost: 0.8,
@@ -309,44 +297,30 @@ Deno.serve(async (req) => {
         retention_policy: "session",
       },
     ]);
-    if (mediaError) throw new Error(`Failed to save media records: ${mediaError.message}`);
 
     const { data: translationItem, error: itemError } = await supabase
       .from("translation_items")
       .insert({
         session_id: sessionId,
-        user_id: userId,
-        speaker_id: speakerId,
+        user_id: userId, // <-- SET USER ID SO RLS SELECT POLICIES CAN SYNC LOGS HISTORY DRAWERS!
         sequence_number: sequenceNumber,
+        speaker_id: speakerId,
         source_text: sourceText,
         translated_text: translatedText,
-        transliteration: translation.transliteration || null,
-        detected_language: translation.detected_language || detectedLanguage,
-        source_language: source === "auto" ? detectedLanguage : source,
-        target_language: target,
-        alternatives: translation.alternatives || [],
-        context_notes: translation.context_notes || null,
+        transliteration: null,
+        detected_language: detectedLanguage,
+        alternatives: [],
+        context_notes: null,
         source_audio_path: inputAudioPath,
         generated_audio_path: outputAudioPath,
       })
       .select("id")
       .single();
-    if (itemError || !translationItem) {
-      throw new Error(`Failed to save the translated turn: ${itemError?.message}`);
-    }
+    if (itemError || !translationItem) throw new Error(`Failed to save translation item: ${itemError?.message}`);
 
-    if (createdSession) {
-      await supabase.from("translation_sessions").update({
-        title: sourceText.slice(0, 80),
-        source_language: source === "auto" ? detectedLanguage : source,
-      }).eq("id", sessionId).eq("user_id", userId);
-    }
-
-    await logUsageEvent(userId, "tts", translatedText.length, "characters", {
+    await logUsageEvent(userId, "tts", outputBlob.size, "bytes", {
       session_id: sessionId,
       voice_id: voiceId,
-      provider: "elevenlabs",
-      model: "eleven_v3",
       output_size_bytes: outputBlob.size,
     });
 
@@ -360,11 +334,11 @@ Deno.serve(async (req) => {
       translation_item_id: translationItem.id,
       source_text: sourceText,
       translated_text: translatedText,
-      transliteration: translation.transliteration || null,
-      detected_language: translation.detected_language || detectedLanguage,
-      alternatives: translation.alternatives || [],
-      context_notes: translation.context_notes || null,
-      translation_model: generatedTranslation.model,
+      transliteration: null,
+      detected_language: detectedLanguage,
+      alternatives: [],
+      context_notes: null,
+      translation_model: translationModel,
       source_audio_url: sourceUrl?.signedUrl || null,
       generated_audio_url: outputUrl?.signedUrl || null,
     });

@@ -10,19 +10,23 @@ import { colors } from '../constants/colors';
 import { typography } from '../constants/typography';
 import { getLanguageByCode } from '../constants/languages';
 import { Ionicons } from '@expo/vector-icons';
-import { useAudioPlayer } from 'expo-audio';
+import { useAudioPlayer, useAudioPlayerStatus } from 'expo-audio';
 
 type SessionTypeFilter = 'all' | 'text' | 'voice' | 'camera' | 'conversation';
 
 function AudioPlayButton({ audioUrl }: { audioUrl: string }) {
   const [isPlaying, setIsPlaying] = useState(false);
   const player = useAudioPlayer(audioUrl);
+  const status = useAudioPlayerStatus(player);
 
   useEffect(() => {
-    if (isPlaying && !player.playing && player.currentTime >= player.duration - 0.2) {
+    const isFinished = status.duration > 0 
+      ? status.currentTime >= status.duration - 0.2 
+      : false;
+    if (isPlaying && !status.playing && (isFinished || isNaN(status.duration) || status.duration === 0)) {
       setIsPlaying(false);
     }
-  }, [player.playing, player.currentTime]);
+  }, [status.playing, status.currentTime, status.duration]);
 
   const togglePlay = async () => {
     Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);

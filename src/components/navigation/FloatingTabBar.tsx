@@ -89,16 +89,15 @@ export const FloatingTabBar: React.FC<FloatingTabBarProps> = ({
 
   const containerWidth = Math.min(480, width - 32);
   const tabWidth = (containerWidth - 16) / 5; // 8px padding on each side is 16px total padding
-  const activeIndex = useSharedValue(state.index);
+  const translation = useSharedValue(8 + state.index * tabWidth);
 
   React.useEffect(() => {
-    activeIndex.value = state.index;
-  }, [state.index]);
+    translation.value = withTiming(8 + state.index * tabWidth, { duration: 200 });
+  }, [state.index, tabWidth]);
 
   const animatedStyle = useAnimatedStyle(() => {
-    const translation = 8 + activeIndex.value * tabWidth;
     return {
-      transform: [{ translateX: withTiming(translation, { duration: 200 }) }],
+      transform: [{ translateX: translation.value }],
     };
   });
 
